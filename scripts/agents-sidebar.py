@@ -96,6 +96,7 @@ class SidebarApp:
         self.last_snapshot_at = 0.0
         self.message = ""
         self.message_until = 0.0
+        self.last_repair_attempt_at = 0.0
 
     def run_controller(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run([self.controller, *args], capture_output=True, text=True)
@@ -199,6 +200,33 @@ class SidebarApp:
         if previous.active_name != current.active_name and current.active_name in names:
             self.selected_index = names.index(current.active_name)
 
+    def compact_state_needs_repair(self, state: SidebarState) -> bool:
+        if state.mode != "compact" or not state.entries:
+            return False
+        if not state.focus_pane:
+            return True
+
+        labels = {entry.label for entry in state.entries}
+        if not state.active_name or state.active_name not in labels:
+            return True
+
+        return not any(entry.active for entry in state.entries)
+
+    def maybe_repair_compact_state(self, state: SidebarState) -> None:
+        if not self.compact_state_needs_repair(state):
+            return
+        now = time.time()
+        if now - self.last_repair_attempt_at < 0.5:
+            return
+
+        proc = self.run_controller("repair")
+        self.last_repair_attempt_at = now
+        if proc.returncode == 0:
+            self.force_snapshot = True
+            self.set_message("repaired compact layout", 1.0)
+        else:
+            self.set_message(proc.stderr.strip() or proc.stdout.strip() or "failed to repair compact layout", 2.0)
+
     def maybe_refresh_snapshot(self) -> None:
         if not self.snapshot_due():
             return
@@ -213,6 +241,7 @@ class SidebarApp:
 
         self.sync_selection(previous, current)
         self.state = current
+        self.maybe_repair_compact_state(current)
 
     def crop_plain(self, text: str, width: int) -> str:
         if width <= 0:
@@ -253,6 +282,11 @@ class SidebarApp:
         return ""
 
     def entry_display_name(self, entry: Entry) -> str:
+        if entry.kind != "agent":
+            if entry.folder:
+                return entry.folder
+            if entry.command and entry.command.lower() not in {"zsh", "bash", "fish", "sh", "tmux"}:
+                return entry.command
         return entry.label or entry.folder or entry.command or entry.pane_id
 
     def entry_secondary(self, entry: Entry) -> str:
@@ -273,9 +307,9 @@ class SidebarApp:
         secondary = self.entry_secondary(entry)
         branch = entry.branch.strip()
         status_suffix = self.status_suffix(entry)
-        marker = "● " if entry.active else ""
+        marker = "●" if entry.active else " "
 
-        plain = f" {index:>2} {marker}{name}"
+        plain = f" {marker} {index:>2} {name}"
         if secondary:
             plain += f" · {secondary}"
         if branch:
@@ -293,10 +327,14 @@ class SidebarApp:
             return self.render_line(truncated, *styles)
 
         parts: List[str] = []
-        parts.extend([DIM, f" {index:>2} ", RESET])
+        if entry.active:
+            parts.extend([FG_MAGENTA, BOLD, f" {marker} ", RESET])
+        else:
+            parts.extend([DIM, f" {marker} ", RESET])
+        parts.extend([DIM, f"{index:>2} ", RESET])
 
         if entry.active:
-            parts.extend([FG_MAGENTA, BOLD, marker, name, RESET])
+            parts.extend([FG_MAGENTA, BOLD, name, RESET])
         else:
             parts.append(name)
         if secondary:

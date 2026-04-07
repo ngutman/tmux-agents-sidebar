@@ -6,8 +6,8 @@ It gives you:
 - a compact sidebar UI with separate `Agents` and `Panes` sections
 - fast switching between managed panes
 - compact mode that keeps inactive panes in a detached tmux store session instead of visible helper windows
-- pane labels derived from cwd / branch context
-- optional Pi integration for pane-border activity indicators and sidebar status updates
+- pane labels derived from cwd / git branch context
+- optional Pi integration for pane-border activity indicators and sidebar row status
 
 ## Features
 
@@ -26,24 +26,32 @@ It gives you:
 
 ## Requirements
 
+Required:
 - `tmux`
 - `bash`
 - `python3`
 
 Optional:
+- `git` for branch-aware pane labels
 - [TPM](https://github.com/tmux-plugins/tpm)
 - [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) for pane activity indicators and richer agent status
 
 ## Installation with TPM
 
-Once this repository is published, add it to your TPM plugin list:
+If you are using a published GitHub copy of this repository, add it to your TPM plugin list:
 
 ```tmux
-set -g @plugin '<your-github-user>/tmux-agents-sidebar'
+set -g @plugin '<owner>/tmux-agents-sidebar'
 run '~/.tmux/plugins/tpm/tpm'
 ```
 
 Then press `prefix + I`.
+
+TPM will install the plugin to:
+
+```text
+~/.tmux/plugins/tmux-agents-sidebar/
+```
 
 The plugin entrypoint is:
 
@@ -53,7 +61,7 @@ The plugin entrypoint is:
 
 ## Manual / local installation
 
-For local development or a pre-publication setup:
+For local development, testing, or a direct clone without TPM:
 
 ```bash
 mkdir -p ~/.tmux/plugins
@@ -77,7 +85,7 @@ tmux source-file ~/.tmux.conf
 Default key bindings:
 - `prefix m` — compact mode
 - `prefix M` — wide mode
-- `prefix N` — create a new managed agent pane
+- `prefix N` — create a new managed pane
 - `prefix a` — focus the sidebar pane
 - `prefix x` — compact-aware kill for the current managed pane
 - `prefix ]` / `prefix [` — next / previous entry
@@ -91,12 +99,19 @@ Default key bindings:
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar wide
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar new
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar kill-current
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar repair
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar focus <name>
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar focus-keep-sidebar <name>
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar next
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar next-keep-sidebar
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar prev
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar prev-keep-sidebar
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar toggle-last
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar focus-sidebar
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar focus-right
-~/projects/tmux-agents-sidebar/scripts/agents-sidebar register <pane-id> <name>
-~/projects/tmux-agents-sidebar/scripts/agents-sidebar mark-agent <pane-id> [provider] [label]
-~/projects/tmux-agents-sidebar/scripts/agents-sidebar mark-pane <pane-id> [label]
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar register <pane-id>
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar mark-agent <pane-id> [provider]
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar mark-pane <pane-id>
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar set-status <pane-id> <status> [text]
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar clear-status <pane-id>
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar list-entries
@@ -104,9 +119,26 @@ Default key bindings:
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar snapshot
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar cleanup-dead
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar refresh
-~/projects/tmux-agents-sidebar/scripts/agents-sidebar repair
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar status
 ```
+
+## Configuration
+
+Session or global tmux options you may want to override:
+
+```tmux
+set -g @agents_sidebar_width 45
+set -g @agents_sidebar_order 'orch plan impl review docs'
+set -g @agents_sidebar_done_ttl 20
+set -g @agents_sidebar_wide_window_name_default 'agents-sidebar'
+```
+
+Notes:
+- the default sidebar width is `45`
+- labels are derived live from pane title, cwd, git branch, and command/provider heuristics
+- labels are made unique automatically when multiple panes would otherwise collide
+- branch labels are derived from each pane's own working directory, not from a shared tmux variable
+- manual pane naming is currently disabled; use pane titles or cwd/branch context instead
 
 ## Pi integration
 

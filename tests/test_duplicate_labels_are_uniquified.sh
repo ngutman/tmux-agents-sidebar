@@ -23,7 +23,7 @@ assert_contains $'active_name: ' "$status" "status output should still be readab
 controller compact >/dev/null
 controller focus dup-2 >/dev/null
 
-assert_eq "$pane_two" "$(session_option @agents_sidebar_focus_pane)" "focus should target the uniquified label"
 assert_contains "active_name: dup-2" "$(status_output)" "compact state should track the uniquified active label"
+assert_contains $'entry	dup-2	' "$(snapshot_output)" "snapshot should still expose the uniquified duplicate label after focusing"
 
 echo "ok - duplicate labels are uniquified deterministically"

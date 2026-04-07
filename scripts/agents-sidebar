@@ -14,6 +14,7 @@ HOST_FULL="$(hostname 2>/dev/null || true)"
 HOST_SHORT="$(hostname -s 2>/dev/null || true)"
 declare -Ag GIT_BRANCH_CACHE=()
 declare -Ag ENTRY_LABEL_CACHE=()
+declare -Ag ENTRY_LABEL_MODE_CACHE=()
 declare -Ag ENTRY_KIND_CACHE=()
 declare -Ag ENTRY_PROVIDER_CACHE=()
 declare -Ag ENTRY_STATUS_CACHE=()
@@ -300,6 +301,7 @@ load_session_metadata_cache() {
   [[ "$SESSION_METADATA_CACHE_LOADED" == "1" ]] && return 0
 
   ENTRY_LABEL_CACHE=()
+  ENTRY_LABEL_MODE_CACHE=()
   ENTRY_KIND_CACHE=()
   ENTRY_PROVIDER_CACHE=()
   ENTRY_STATUS_CACHE=()
@@ -318,6 +320,10 @@ load_session_metadata_cache() {
       @agents_sidebar_name_*)
         key="${name#@agents_sidebar_name_}"
         ENTRY_LABEL_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_label_mode_*)
+        key="${name#@agents_sidebar_label_mode_}"
+        ENTRY_LABEL_MODE_CACHE["$key"]="$value"
         ;;
       @agents_sidebar_kind_*)
         key="${name#@agents_sidebar_kind_}"
@@ -382,6 +388,30 @@ clear_entry_label() {
   key="$(metadata_cache_key "$pane_id")"
   unset_option "$(label_option_key "$pane_id")"
   unset "ENTRY_LABEL_CACHE[$key]"
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_label_mode() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_LABEL_MODE_CACHE[$key]:-auto}"
+}
+
+remember_entry_label_mode() {
+  local pane_id="$1"
+  local mode="$2"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  if [[ -n "$mode" ]]; then
+    set_option "$(meta_option_key "$pane_id" label_mode)" "$mode"
+    ENTRY_LABEL_MODE_CACHE["$key"]="$mode"
+  else
+    unset_option "$(meta_option_key "$pane_id" label_mode)"
+    unset "ENTRY_LABEL_MODE_CACHE[$key]"
+  fi
   SESSION_METADATA_CACHE_LOADED=1
 }
 
@@ -583,6 +613,7 @@ clear_entry_branch_cache() {
 clear_entry_metadata() {
   local pane_id="$1"
   clear_entry_label "$pane_id"
+  remember_entry_label_mode "$pane_id" ""
   remember_entry_kind "$pane_id" ""
   remember_entry_provider "$pane_id" ""
   remember_entry_status "$pane_id" ""
@@ -609,6 +640,11 @@ valid_entry_status() {
 is_shell_command() {
   local command="${1,,}"
   [[ "$command" == "zsh" || "$command" == "bash" || "$command" == "fish" || "$command" == "sh" || "$command" == "tmux" ]]
+}
+
+is_generic_host_title() {
+  local title="$1"
+  [[ -z "$title" || "$title" == "$HOST_FULL" || "$title" == "$HOST_SHORT" || "$title" =~ \.local$ ]]
 }
 
 entry_in_agent_order() {
@@ -701,25 +737,13 @@ resolve_entry_kind() {
 }
 
 derive_entry_label() {
-  local stored_label="$1"
-  local provider="$2"
-  local pane_title="$3"
-  local pane_folder="$4"
-  local pane_branch="$5"
-  local pane_command="$6"
-  local pane_id="$7"
+  local provider="$1"
+  local pane_title="$2"
+  local pane_folder="$3"
+  local pane_branch="$4"
+  local pane_command="$5"
+  local pane_id="$6"
   local label trimmed
-
-  if [[ -n "$stored_label" ]]; then
-    if [[ -n "$pane_folder" && "$stored_label" == */"$pane_folder" ]]; then
-      echo "$pane_folder"
-      return
-    fi
-    if [[ "$provider" != "pi" || "$stored_label" != "$pane_title" ]]; then
-      echo "$stored_label"
-      return
-    fi
-  fi
 
   if [[ "$provider" == "pi" && "$pane_title" == "π - "* ]]; then
     echo "${pane_title#π - }"
@@ -861,7 +885,7 @@ unique_entry_label_for_pane() {
 
 collect_entry_lines() {
   local sidebar_pane store_session line session_id window_id window_name pane_id pane_dead pane_title pane_command pane_path pane_folder pane_branch
-  local stored_label stored_kind stored_provider label base_label provider kind status status_text last_done suffix key
+  local stored_kind stored_provider label base_label provider kind status status_text last_done suffix key
   local cached_path cached_branch cached_checked now age
   local -A seen_labels=()
 
@@ -881,7 +905,6 @@ collect_entry_lines() {
 
     key="${pane_id#%}"
     pane_folder="$(path_label "$pane_path")"
-    stored_label="${ENTRY_LABEL_CACHE[$key]:-}"
     stored_kind="${ENTRY_KIND_CACHE[$key]:-}"
     stored_provider="${ENTRY_PROVIDER_CACHE[$key]:-}"
 
@@ -910,27 +933,20 @@ collect_entry_lines() {
       fi
     fi
 
-    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "$stored_label" "$pane_title" "$pane_command")"
-    base_label="$(derive_entry_label "$stored_label" "$provider" "$pane_title" "$pane_folder" "$pane_branch" "$pane_command" "$pane_id")"
-    label="$base_label"
-
-    if [[ -z "$stored_label" ]]; then
-      if [[ -n "${seen_labels[$label]:-}" && "${seen_labels[$label]}" != "$pane_id" ]]; then
-        label="${base_label}-${pane_id#%}"
-      fi
-    else
-      suffix=2
-      while [[ -n "${seen_labels[$label]:-}" && "${seen_labels[$label]}" != "$pane_id" ]]; do
-        label="${base_label}-${suffix}"
-        suffix=$((suffix + 1))
-      done
+    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "" "$pane_title" "$pane_command")"
+    if [[ "$stored_kind" == "agent" && "$provider" != "pi" && "$provider" != "codex" && "$provider" != "claude" ]] && is_shell_command "$pane_command" && is_generic_host_title "$pane_title"; then
+      stored_kind="pane"
+      remember_entry_kind "$pane_id" pane
     fi
+    base_label="$(derive_entry_label "$provider" "$pane_title" "$pane_folder" "$pane_branch" "$pane_command" "$pane_id")"
+    label="$base_label"
+    suffix=2
+    while [[ -n "${seen_labels[$label]:-}" && "${seen_labels[$label]}" != "$pane_id" ]]; do
+      label="${base_label}-${suffix}"
+      suffix=$((suffix + 1))
+    done
     seen_labels["$label"]="$pane_id"
 
-    if [[ -n "$stored_label" && "$label" != "$stored_label" ]]; then
-      remember_entry_label "$pane_id" "$label"
-      stored_label="$label"
-    fi
     kind="$(resolve_entry_kind "$stored_kind" "$provider" "$label" "$pane_title" "$pane_command")"
     status="$(effective_entry_status "$pane_id" "$kind")"
     status_text="${ENTRY_STATUS_TEXT_CACHE[$key]:-}"
@@ -1028,13 +1044,8 @@ first_entry_name() {
 }
 
 current_entry_name() {
-  local pane_id label line
+  local pane_id line
   pane_id="$(current_pane_id)"
-  label="$(stored_entry_label "$pane_id")"
-  if [[ -n "$label" ]]; then
-    echo "$label"
-    return
-  fi
   line="$(discover_entries | awk -F "$DELIM" -v pane="$pane_id" '$2 == pane { print; exit }')"
   if [[ -n "$line" ]]; then
     echo "${line%%$DELIM*}"
@@ -1274,13 +1285,11 @@ cmd_compact() {
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     IFS="$DELIM" read -r label pane_id _window_id _window_name _kind _rest <<<"$line"
-    remember_entry_label "$pane_id" "$label"
     [[ "$pane_id" == "$active_pane" ]] && continue
     tmux join-pane -d -s "$pane_id" -t "$(store_target_pane)"
   done < <(printf '%s\n' "${entry_lines[@]}")
 
   sidebar_pane="$(create_sidebar_pane "$active_pane" "$width" "$compact_window")"
-  remember_entry_label "$active_pane" "$active_name"
 
   set_option @agents_sidebar_mode compact
   set_option @agents_sidebar_compact_window "$compact_window"
@@ -1479,9 +1488,19 @@ cmd_focus_right() {
 }
 
 refresh_active_state() {
-  local mode active_name active_pane
+  local mode active_name active_pane current_name
   mode="$(get_option @agents_sidebar_mode)"
   [[ "$mode" == 'compact' ]] || return 0
+
+  active_pane="$(get_option @agents_sidebar_focus_pane)"
+  if [[ -n "$active_pane" ]] && pane_exists "$active_pane"; then
+    current_name="$(discover_entries | awk -F "$DELIM" -v pane="$active_pane" '$2 == pane { print $1; exit }')"
+    if [[ -n "$current_name" && "$current_name" != "$(get_option @agents_sidebar_active_name)" ]]; then
+      set_option @agents_sidebar_active_name "$current_name"
+      bump_epoch
+    fi
+    return 0
+  fi
 
   active_name="$(get_option @agents_sidebar_active_name)"
   if [[ -z "$active_name" ]] || ! active_pane="$(entry_pane_by_name "$active_name" 2>/dev/null)"; then
@@ -1546,7 +1565,7 @@ cmd_kill_current() {
     fi
 
     if [[ -n "$focus_pane" && "$target_pane" == "$focus_pane" ]]; then
-      label="$(stored_entry_label "$target_pane")"
+      label="$(discover_entries | awk -F "$DELIM" -v pane="$target_pane" '$2 == pane { print $1; exit }')"
       next_name="$(ordered_entry_names | grep -Fxv "$label" | head -n1 || true)"
       if [[ -n "$next_name" ]]; then
         cmd_focus "$next_name"
@@ -1568,8 +1587,8 @@ cmd_kill_current() {
 }
 
 cmd_new() {
-  local mode source_pane source_path compact_window target_for_split new_pane label
-  local sidebar_pane focus_pane
+  local mode source_pane source_path compact_window target_for_split new_pane
+  local sidebar_pane focus_pane active_name new_name
 
   cleanup_dead_panes
   mode="$(get_option @agents_sidebar_mode)"
@@ -1586,77 +1605,63 @@ cmd_new() {
 
   if [[ "$mode" == 'compact' ]]; then
     compact_window="$(get_option @agents_sidebar_compact_window)"
+    focus_pane="$(get_option @agents_sidebar_focus_pane)"
+    active_name="$(get_option @agents_sidebar_active_name)"
     ensure_store_window "$source_path" >/dev/null
     target_for_split="$(store_target_pane)"
     new_pane="$(tmux split-window -d -h -t "$target_for_split" -c "$source_path" -P -F '#{pane_id}')"
-    label="$(derive_label_for_new_pane "$new_pane")"
-    remember_entry_label "$new_pane" "$label"
-    remember_entry_kind "$new_pane" agent
-    append_agent_order "$label"
+    remember_entry_kind "$new_pane" pane
+    tmux swap-pane -d -s "$new_pane" -t "$focus_pane"
+    new_name="$(discover_entries | awk -F "$DELIM" -v pane="$new_pane" '$2 == pane { print $1; exit }')"
+    [[ -n "$new_name" ]] || fail "failed to discover new pane"
+    set_option @agents_sidebar_last_active_name "$active_name"
+    set_option @agents_sidebar_active_name "$new_name"
+    set_option @agents_sidebar_focus_pane "$new_pane"
     bump_epoch
-    cmd_focus "$label"
     tmux select-window -t "$compact_window"
-    tmux select-pane -t "$(get_option @agents_sidebar_focus_pane)"
+    tmux select-pane -t "$new_pane"
   else
     new_pane="$(tmux split-window -h -t "$source_pane" -c "$source_path" -P -F '#{pane_id}')"
-    label="$(derive_label_for_new_pane "$new_pane")"
-    remember_entry_label "$new_pane" "$label"
-    remember_entry_kind "$new_pane" agent
-    append_agent_order "$label"
+    remember_entry_kind "$new_pane" pane
     tmux select-layout even-horizontal >/dev/null 2>&1 || true
     bump_epoch
     tmux select-pane -t "$new_pane"
   fi
-
-  echo "$label"
 }
 
 cmd_register() {
   local pane_id="$1"
-  local label="$2"
-  [[ -n "$pane_id" && -n "$label" ]] || fail "register requires <pane-id> <label>"
+  [[ -n "$pane_id" ]] || fail "register requires <pane-id>"
   pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
-  label="$(unique_entry_label_for_pane "$pane_id" "$label")"
-  remember_entry_label "$pane_id" "$label"
+  clear_entry_label "$pane_id"
+  remember_entry_label_mode "$pane_id" ""
   remember_entry_kind "$pane_id" agent
-  append_agent_order "$label"
   bump_epoch
 }
 
 cmd_mark_agent() {
   local pane_id="$1"
   local maybe_provider="${2:-}"
-  local maybe_label="${3:-}"
   local provider="unknown"
-  local label=""
 
   pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
   if valid_entry_provider "$maybe_provider" && [[ "$maybe_provider" != "shell" ]]; then
     provider="$maybe_provider"
-    label="$maybe_label"
-  else
-    label="$maybe_provider"
   fi
 
+  clear_entry_label "$pane_id"
+  remember_entry_label_mode "$pane_id" ""
   remember_entry_kind "$pane_id" agent
   [[ -n "$provider" ]] && remember_entry_provider "$pane_id" "$provider"
-  if [[ -n "$label" ]]; then
-    label="$(unique_entry_label_for_pane "$pane_id" "$label")"
-    remember_entry_label "$pane_id" "$label"
-    append_agent_order "$label"
-  fi
   bump_epoch
 }
 
 cmd_mark_pane() {
   local pane_id="$1"
-  local label="${2:-}"
   pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
+  clear_entry_label "$pane_id"
+  remember_entry_label_mode "$pane_id" ""
   remember_entry_kind "$pane_id" pane
-  if [[ -n "$label" ]]; then
-    label="$(unique_entry_label_for_pane "$pane_id" "$label")"
-    remember_entry_label "$pane_id" "$label"
-  fi
   bump_epoch
 }
 
@@ -1802,10 +1807,9 @@ commands:
   toggle-last                   jump back to the previously focused entry
   focus-sidebar                 move keyboard focus to the sidebar pane
   focus-right                   move keyboard focus to the active pane
-  register <pane> <name>        assign a stable label and mark the pane as an agent
-  mark-agent <pane> [provider] [label]
-                                classify a pane as an agent
-  mark-pane <pane> [label]      classify a pane as a regular pane
+  register <pane>               classify a pane as an agent using its live-derived label
+  mark-agent <pane> [provider]  classify a pane as an agent
+  mark-pane <pane>              classify a pane as a regular pane
   set-status <pane> <status> [text]
                                 set pane status: idle|running|tool|done|error|unknown
   clear-status <pane>           clear pane status metadata
@@ -1868,16 +1872,16 @@ main() {
       cmd_focus_right
       ;;
     register)
-      [[ $# -ge 3 ]] || fail "register requires <pane-id> <label>"
-      cmd_register "$2" "$3"
+      [[ $# -ge 2 ]] || fail "register requires <pane-id>"
+      cmd_register "$2"
       ;;
     mark-agent)
-      [[ $# -ge 2 ]] || fail "mark-agent requires <pane-id> [provider] [label]"
-      cmd_mark_agent "$2" "${3:-}" "${4:-}"
+      [[ $# -ge 2 ]] || fail "mark-agent requires <pane-id> [provider]"
+      cmd_mark_agent "$2" "${3:-}"
       ;;
     mark-pane)
-      [[ $# -ge 2 ]] || fail "mark-pane requires <pane-id> [label]"
-      cmd_mark_pane "$2" "${3:-}"
+      [[ $# -ge 2 ]] || fail "mark-pane requires <pane-id>"
+      cmd_mark_pane "$2"
       ;;
     set-status)
       [[ $# -ge 3 ]] || fail "set-status requires <pane-id> <status> [text]"

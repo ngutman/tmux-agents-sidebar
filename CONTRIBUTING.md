@@ -4,11 +4,12 @@ Issues and pull requests are welcome.
 
 ## Before sending changes
 
+- read `AGENTS.md` and the relevant docs in `docs/`
 - run `./run_tests`
 - run `bash -n` on shell entrypoints
 - run `python3 -m py_compile scripts/agents-sidebar.py`
 - keep tmux behavior compatible with both compact and wide mode
-- update docs when commands, setup, or state semantics change
+- update docs when commands, setup, install steps, or state semantics change
 
 ## Style
 

@@ -87,31 +87,6 @@ export default function agentsSidebarStatusExtension(pi: ExtensionAPI) {
 		await setSessionOption(sidebarPaneOptionName(suffix), value);
 	}
 
-	function renderFooterStatus(ctx: ExtensionContext, status: SidebarStatus, statusText = ""): void {
-		if (!ctx.hasUI) return;
-		const theme = ctx.ui.theme;
-		let text = theme.fg("dim", "π sidebar ");
-		if (status === "tool") {
-			text += theme.fg("warning", "⚙");
-			text += theme.fg("dim", ` ${statusText || "tool"}`);
-		} else if (status === "running") {
-			text += theme.fg("accent", "●");
-			text += theme.fg("dim", " running");
-		} else if (status === "done") {
-			text += theme.fg("success", "✓");
-			text += theme.fg("dim", " finished");
-		} else if (status === "error") {
-			text += theme.fg("error", "✗");
-			text += theme.fg("dim", " errored");
-		} else if (status === "idle") {
-			text += theme.fg("dim", "waiting");
-		} else {
-			text += theme.fg("warning", "?");
-			text += theme.fg("dim", " unknown");
-		}
-		ctx.ui.setStatus("agents-sidebar", text);
-	}
-
 	async function seedLabelIfMissing(ctx: ExtensionContext): Promise<void> {
 		const sid = await ensureSessionId();
 		if (!sid) return;
@@ -130,7 +105,7 @@ export default function agentsSidebarStatusExtension(pi: ExtensionAPI) {
 		}
 	}
 
-	async function publishState(ctx: ExtensionContext, status: SidebarStatus, statusText = ""): Promise<void> {
+	async function publishState(_ctx: ExtensionContext, status: SidebarStatus, statusText = ""): Promise<void> {
 		if (!inTmux) return;
 		clearDoneTimer();
 		currentStatus = status;
@@ -142,7 +117,6 @@ export default function agentsSidebarStatusExtension(pi: ExtensionAPI) {
 		await setPaneOption("@pi_session_state", status);
 		await setPaneOption("@pi_session_indicator", indicatorForStatus(status));
 		await bumpEpoch();
-		renderFooterStatus(ctx, status, statusText);
 	}
 
 	async function publishIdle(ctx: ExtensionContext): Promise<void> {
@@ -195,8 +169,5 @@ export default function agentsSidebarStatusExtension(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		clearDoneTimer();
 		await publishIdle(ctx);
-		if (ctx.hasUI) {
-			ctx.ui.setStatus("agents-sidebar", undefined);
-		}
 	});
 }

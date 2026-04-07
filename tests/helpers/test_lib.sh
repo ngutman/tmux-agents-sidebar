@@ -117,21 +117,30 @@ create_git_repo() {
 
 register_pane() {
   local pane_id="$1"
-  local label="$2"
-  controller register "$pane_id" "$label" >/dev/null
+  local label="${2:-}"
+  if [[ -n "$label" ]]; then
+    set_pane_title "$pane_id" "$label"
+  fi
+  controller register "$pane_id" >/dev/null
 }
 
 mark_agent() {
   local pane_id="$1"
   local provider="${2:-unknown}"
   local label="${3:-}"
-  controller mark-agent "$pane_id" "$provider" "$label" >/dev/null
+  if [[ -n "$label" ]]; then
+    set_pane_title "$pane_id" "$label"
+  fi
+  controller mark-agent "$pane_id" "$provider" >/dev/null
 }
 
 mark_pane() {
   local pane_id="$1"
   local label="${2:-}"
-  controller mark-pane "$pane_id" "$label" >/dev/null
+  if [[ -n "$label" ]]; then
+    set_pane_title "$pane_id" "$label"
+  fi
+  controller mark-pane "$pane_id" >/dev/null
 }
 
 set_pane_status() {
@@ -173,4 +182,31 @@ list_session_window_names() {
 
 session_window_count() {
   tmux_test list-windows -t "$TEST_SESSION_ID" | wc -l | tr -d ' '
+}
+
+wait_until() {
+  local command="$1"
+  local timeout_seconds="${2:-3}"
+  local interval="${3:-0.05}"
+  local deadline
+  deadline="$(python3 - <<PY
+import time
+print(time.time() + float(${timeout_seconds}))
+PY
+)"
+
+  while true; do
+    if eval "$command"; then
+      return 0
+    fi
+    python3 - <<PY
+import time
+if time.time() >= float(${deadline}):
+    raise SystemExit(1)
+time.sleep(float(${interval}))
+PY
+    if [[ "$?" -ne 0 ]]; then
+      return 1
+    fi
+  done
 }

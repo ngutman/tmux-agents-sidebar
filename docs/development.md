@@ -3,6 +3,7 @@
 ## Repository layout
 
 ```text
+AGENTS.md                  # repository purpose, docs map, and agent reminders
 tmux-agents-sidebar.tmux   # canonical tmux plugin entrypoint
 plugin.tmux                # compatibility wrapper
 scripts/
@@ -22,6 +23,8 @@ cd ~/projects/tmux-agents-sidebar
 ```
 
 The test suite is a lightweight shell integration setup inspired by common tmux plugin repository layouts (`run_tests` plus executable `tests/test_*.sh` files).
+
+Before making larger changes, read `AGENTS.md`, `README.md`, and the relevant docs in `docs/`.
 
 ## Manual checks
 

@@ -5,6 +5,8 @@
 1. the sidebar row for that Pi pane
 2. the tmux pane border next to `P#{pane_index}`
 
+It does not render any separate Pi footer or bottom status area in the Pi UI.
+
 ## What it shows
 
 Pi panes publish these states:
@@ -36,7 +38,6 @@ Link the extension into Pi's global extension directory:
 ```bash
 mkdir -p ~/.pi/agent ~/.pi/agent/extensions
 ln -sfn ~/workspace/configs/pi/agent/settings.json ~/.pi/agent/settings.json
-ln -sfn ~/workspace/configs/pi/agent/extensions/minimal-footer.ts ~/.pi/agent/extensions/minimal-footer.ts
 ln -sfn ~/projects/tmux-agents-sidebar/integrations/pi/agents-sidebar-status.ts ~/.pi/agent/extensions/agents-sidebar-status.ts
 ```
 
