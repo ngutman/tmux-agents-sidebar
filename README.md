@@ -9,6 +9,8 @@ It gives you:
 - pane labels derived from cwd / git branch context
 - optional Pi integration for pane-border activity indicators and sidebar row status
 
+![tmux agents sidebar screenshot](assets/agents-sidebar.png)
+
 ## Features
 
 - `wide` mode for even-horizontal multi-pane layouts
