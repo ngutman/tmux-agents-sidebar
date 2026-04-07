@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CURRENT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+failures=0
+ran=0
+
+for test_file in "$CURRENT_DIR"/tests/test_*.sh; do
+  [[ -e "$test_file" ]] || continue
+  ran=$((ran + 1))
+  echo "==> $(basename "$test_file")"
+  if "$test_file"; then
+    echo "PASS $(basename "$test_file")"
+  else
+    echo "FAIL $(basename "$test_file")" >&2
+    failures=$((failures + 1))
+  fi
+  echo
+done
+
+if [[ "$ran" -eq 0 ]]; then
+  echo "No tests found" >&2
+  exit 1
+fi
+
+if [[ "$failures" -ne 0 ]]; then
+  echo "$failures test(s) failed" >&2
+  exit 1
+fi
+
+echo "Success, tests pass!"

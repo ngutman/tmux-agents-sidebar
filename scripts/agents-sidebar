@@ -1,0 +1,1917 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SIDEBAR_SCRIPT="$SCRIPT_DIR/agents-sidebar.py"
+
+DEFAULT_AGENT_ORDER="orch plan impl review docs"
+DEFAULT_SIDEBAR_WIDTH="45"
+DEFAULT_WIDE_WINDOW_NAME="agents-sidebar"
+DEFAULT_DONE_TTL="20"
+BRANCH_CACHE_TTL="2"
+DELIM=$'\x1f'
+HOST_FULL="$(hostname 2>/dev/null || true)"
+HOST_SHORT="$(hostname -s 2>/dev/null || true)"
+declare -Ag GIT_BRANCH_CACHE=()
+declare -Ag ENTRY_LABEL_CACHE=()
+declare -Ag ENTRY_KIND_CACHE=()
+declare -Ag ENTRY_PROVIDER_CACHE=()
+declare -Ag ENTRY_STATUS_CACHE=()
+declare -Ag ENTRY_STATUS_TEXT_CACHE=()
+declare -Ag ENTRY_LAST_DONE_CACHE=()
+declare -Ag ENTRY_BRANCH_VALUE_CACHE=()
+declare -Ag ENTRY_BRANCH_PATH_CACHE=()
+declare -Ag ENTRY_BRANCH_CHECKED_CACHE=()
+SESSION_METADATA_CACHE_LOADED=0
+
+fail() {
+  local message="agents-sidebar: $*"
+  echo "$message" >&2
+  if [[ "${AGENTS_SIDEBAR_NOTIFY:-0}" == "1" ]] && command -v tmux >/dev/null 2>&1; then
+    local target="${AGENTS_SIDEBAR_PANE:-${TMUX_PANE:-}}"
+    if [[ -n "$target" ]]; then
+      tmux display-message -d 5000 -t "$target" "$message" 2>/dev/null || true
+    else
+      tmux display-message -d 5000 "$message" 2>/dev/null || true
+    fi
+  fi
+  exit 1
+}
+
+tmux_available() {
+  command -v tmux >/dev/null 2>&1
+}
+
+current_session_id() {
+  local target_pane="${AGENTS_SIDEBAR_PANE:-${TMUX_PANE:-}}"
+  if [[ -n "$target_pane" ]]; then
+    tmux display-message -p -t "$target_pane" '#{session_id}'
+  else
+    tmux display-message -p '#{session_id}'
+  fi
+}
+
+SESSION_ID=""
+
+init_session() {
+  tmux_available || fail "tmux is not installed"
+  if [[ -n "${AGENTS_SIDEBAR_SESSION:-}" ]]; then
+    SESSION_ID="$AGENTS_SIDEBAR_SESSION"
+  elif [[ -n "${TMUX:-}" || -n "${TMUX_PANE:-}" || -n "${AGENTS_SIDEBAR_PANE:-}" ]]; then
+    SESSION_ID="$(current_session_id)"
+  else
+    fail "must be run inside tmux or with AGENTS_SIDEBAR_SESSION set"
+  fi
+}
+
+get_option() {
+  local name="$1"
+  local value
+  value="$(tmux show-option -qv -t "$SESSION_ID" "$name" 2>/dev/null || true)"
+  if [[ -z "$value" ]]; then
+    value="$(tmux show-option -gqv "$name" 2>/dev/null || true)"
+  fi
+  echo "$value"
+}
+
+set_option() {
+  tmux set-option -q -t "$SESSION_ID" "$1" "$2"
+}
+
+unset_option() {
+  tmux set-option -qu -t "$SESSION_ID" "$1" 2>/dev/null || true
+}
+
+bump_epoch() {
+  local current next
+  current="$(get_option @agents_sidebar_epoch)"
+  current="${current:-0}"
+  next=$((current + 1))
+  set_option @agents_sidebar_epoch "$next"
+}
+
+remember_sidebar_width() {
+  local pane_id="${1:-$(get_option @agents_sidebar_pane)}"
+  local width
+
+  if [[ -n "$pane_id" ]] && pane_exists "$pane_id"; then
+    width="$(tmux display-message -p -t "$pane_id" '#{pane_width}' 2>/dev/null || true)"
+    if [[ "$width" =~ ^[0-9]+$ && "$width" -gt 0 ]]; then
+      set_option @agents_sidebar_width "$width"
+    fi
+  fi
+}
+
+sidebar_width() {
+  local value pane_id
+  value="$(get_option @agents_sidebar_width)"
+  if [[ -n "$value" ]]; then
+    echo "$value"
+    return 0
+  fi
+
+  pane_id="$(get_option @agents_sidebar_pane)"
+  if [[ -n "$pane_id" ]] && pane_exists "$pane_id"; then
+    value="$(tmux display-message -p -t "$pane_id" '#{pane_width}' 2>/dev/null || true)"
+    if [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
+      echo "$value"
+      return 0
+    fi
+  fi
+
+  echo "$DEFAULT_SIDEBAR_WIDTH"
+}
+
+wide_window_name_default() {
+  local value
+  value="$(get_option @agents_sidebar_wide_window_name_default)"
+  echo "${value:-$DEFAULT_WIDE_WINDOW_NAME}"
+}
+
+agent_order_string() {
+  local value
+  value="$(get_option @agents_sidebar_order)"
+  echo "${value:-$DEFAULT_AGENT_ORDER}"
+}
+
+done_status_ttl() {
+  local value
+  value="$(get_option @agents_sidebar_done_ttl)"
+  echo "${value:-$DEFAULT_DONE_TTL}"
+}
+
+is_internal_window_name() {
+  local name="$1"
+  [[ "$name" == "__agents_sidebar_compact" || "$name" == "__agents_sidebar_pool" || "$name" == "$(store_window_name)" ]]
+}
+
+is_internal_pane_title() {
+  local title="$1"
+  [[ "$title" == __agents_sidebar_* ]]
+}
+
+pane_exists() {
+  local pane_id="$1"
+  tmux list-panes -a -F '#{pane_id}' | grep -Fxq "$pane_id"
+}
+
+window_exists() {
+  local window_id="$1"
+  tmux list-windows -a -F '#{window_id}' | grep -Fxq "$window_id"
+}
+
+pane_is_dead() {
+  local pane_id="$1"
+  [[ "$(tmux display-message -p -t "$pane_id" '#{pane_dead}' 2>/dev/null || echo 1)" == "1" ]]
+}
+
+current_pane_id() {
+  if [[ -n "${AGENTS_SIDEBAR_PANE:-}" ]]; then
+    echo "$AGENTS_SIDEBAR_PANE"
+  elif [[ -n "${TMUX_PANE:-}" ]]; then
+    echo "$TMUX_PANE"
+  else
+    tmux display-message -p '#{pane_id}'
+  fi
+}
+
+current_window_name() {
+  tmux display-message -p -t "$(current_pane_id)" '#{window_name}'
+}
+
+pane_session_id() {
+  tmux display-message -p -t "$1" '#{session_id}'
+}
+
+pane_window_id() {
+  tmux display-message -p -t "$1" '#{window_id}'
+}
+
+session_exists() {
+  local session_id="$1"
+  [[ -n "$session_id" ]] || return 1
+  tmux has-session -t "$session_id" 2>/dev/null
+}
+
+store_session_name() {
+  local session_key
+  session_key="${SESSION_ID//[^[:alnum:]]/_}"
+  echo "__agents_sidebar_store_${session_key}"
+}
+
+store_window_name() {
+  echo "__agents_sidebar_store"
+}
+
+store_session_id() {
+  get_option @agents_sidebar_store_session
+}
+
+store_window_id() {
+  get_option @agents_sidebar_store_window
+}
+
+clear_store_state() {
+  unset_option @agents_sidebar_store_session
+  unset_option @agents_sidebar_store_window
+}
+
+kill_store_session() {
+  local store_session store_name
+  store_session="$(store_session_id)"
+  if [[ -n "$store_session" ]] && session_exists "$store_session"; then
+    tmux kill-session -t "$store_session" 2>/dev/null || true
+  fi
+
+  store_name="$(store_session_name)"
+  tmux kill-session -t "$store_name" 2>/dev/null || true
+  clear_store_state
+}
+
+ensure_store_window() {
+  local start_path="${1:-$HOME}"
+  local store_session store_window output placeholder store_name
+
+  store_session="$(store_session_id)"
+  store_window="$(store_window_id)"
+  if [[ -n "$store_session" ]] && session_exists "$store_session" && [[ -n "$store_window" ]] && window_exists "$store_window"; then
+    echo "$store_window"
+    return 0
+  fi
+
+  kill_store_session
+  store_name="$(store_session_name)"
+  output="$(tmux new-session -d -P -F "#{session_id}${DELIM}#{window_id}${DELIM}#{pane_id}" -s "$store_name" -n "$(store_window_name)" -c "$start_path")"
+  IFS="$DELIM" read -r store_session store_window placeholder <<<"$output"
+  tmux set-option -w -t "$store_window" remain-on-exit off >/dev/null 2>&1 || true
+  tmux select-pane -t "$placeholder" -T '__agents_sidebar_store_placeholder' >/dev/null 2>&1 || true
+  set_option @agents_sidebar_store_session "$store_session"
+  set_option @agents_sidebar_store_window "$store_window"
+  echo "$store_window"
+}
+
+store_target_pane() {
+  local store_window target_pane
+  store_window="$(store_window_id)"
+  if [[ -z "$store_window" ]] || ! window_exists "$store_window"; then
+    store_window="$(ensure_store_window)"
+  fi
+  target_pane="$(tmux list-panes -t "$store_window" -F '#{pane_id}' | head -n1)"
+  [[ -n "$target_pane" ]] || fail "store window has no target pane"
+  echo "$target_pane"
+}
+
+REPAIR_LOCK_DIR=""
+
+repair_lock_dir() {
+  local session_key
+  session_key="${SESSION_ID//[^[:alnum:]]/_}"
+  echo "/tmp/agents-sidebar-repair-${session_key}.lock"
+}
+
+with_repair_lock() {
+  REPAIR_LOCK_DIR="$(repair_lock_dir)"
+  if mkdir "$REPAIR_LOCK_DIR" 2>/dev/null; then
+    trap 'rmdir "$REPAIR_LOCK_DIR" 2>/dev/null || true' RETURN
+    return 0
+  fi
+  return 1
+}
+
+label_option_key() {
+  local pane_id="$1"
+  echo "@agents_sidebar_name_${pane_id#%}"
+}
+
+meta_option_key() {
+  local pane_id="$1"
+  local suffix="$2"
+  echo "@agents_sidebar_${suffix}_${pane_id#%}"
+}
+
+metadata_cache_key() {
+  local pane_id="$1"
+  echo "${pane_id#%}"
+}
+
+load_session_metadata_cache() {
+  local line name value key
+
+  [[ "$SESSION_METADATA_CACHE_LOADED" == "1" ]] && return 0
+
+  ENTRY_LABEL_CACHE=()
+  ENTRY_KIND_CACHE=()
+  ENTRY_PROVIDER_CACHE=()
+  ENTRY_STATUS_CACHE=()
+  ENTRY_STATUS_TEXT_CACHE=()
+  ENTRY_LAST_DONE_CACHE=()
+  ENTRY_BRANCH_VALUE_CACHE=()
+  ENTRY_BRANCH_PATH_CACHE=()
+  ENTRY_BRANCH_CHECKED_CACHE=()
+
+  while IFS= read -r line; do
+    [[ "$line" == @agents_sidebar_* ]] || continue
+    name="${line%% *}"
+    value="${line#"$name"}"
+    value="${value# }"
+    case "$name" in
+      @agents_sidebar_name_*)
+        key="${name#@agents_sidebar_name_}"
+        ENTRY_LABEL_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_kind_*)
+        key="${name#@agents_sidebar_kind_}"
+        ENTRY_KIND_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_provider_*)
+        key="${name#@agents_sidebar_provider_}"
+        ENTRY_PROVIDER_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_status_text_*)
+        key="${name#@agents_sidebar_status_text_}"
+        ENTRY_STATUS_TEXT_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_status_*)
+        key="${name#@agents_sidebar_status_}"
+        ENTRY_STATUS_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_last_done_*)
+        key="${name#@agents_sidebar_last_done_}"
+        ENTRY_LAST_DONE_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_branch_path_*)
+        key="${name#@agents_sidebar_branch_path_}"
+        ENTRY_BRANCH_PATH_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_branch_checked_*)
+        key="${name#@agents_sidebar_branch_checked_}"
+        ENTRY_BRANCH_CHECKED_CACHE["$key"]="$value"
+        ;;
+      @agents_sidebar_branch_*)
+        key="${name#@agents_sidebar_branch_}"
+        ENTRY_BRANCH_VALUE_CACHE["$key"]="$value"
+        ;;
+    esac
+  done < <(tmux show-options -t "$SESSION_ID" 2>/dev/null || true)
+
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_label() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_LABEL_CACHE[$key]:-}"
+}
+
+remember_entry_label() {
+  local pane_id="$1"
+  local label="$2"
+  local key
+  [[ -n "$pane_id" && -n "$label" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  set_option "$(label_option_key "$pane_id")" "$label"
+  ENTRY_LABEL_CACHE["$key"]="$label"
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+clear_entry_label() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  unset_option "$(label_option_key "$pane_id")"
+  unset "ENTRY_LABEL_CACHE[$key]"
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_kind() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_KIND_CACHE[$key]:-}"
+}
+
+remember_entry_kind() {
+  local pane_id="$1"
+  local kind="$2"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  if [[ -n "$kind" ]]; then
+    set_option "$(meta_option_key "$pane_id" kind)" "$kind"
+    ENTRY_KIND_CACHE["$key"]="$kind"
+  else
+    unset_option "$(meta_option_key "$pane_id" kind)"
+    unset "ENTRY_KIND_CACHE[$key]"
+  fi
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_provider() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_PROVIDER_CACHE[$key]:-}"
+}
+
+remember_entry_provider() {
+  local pane_id="$1"
+  local provider="$2"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  if [[ -n "$provider" ]]; then
+    set_option "$(meta_option_key "$pane_id" provider)" "$provider"
+    ENTRY_PROVIDER_CACHE["$key"]="$provider"
+  else
+    unset_option "$(meta_option_key "$pane_id" provider)"
+    unset "ENTRY_PROVIDER_CACHE[$key]"
+  fi
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_status() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_STATUS_CACHE[$key]:-}"
+}
+
+remember_entry_status() {
+  local pane_id="$1"
+  local status="$2"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  if [[ -n "$status" ]]; then
+    set_option "$(meta_option_key "$pane_id" status)" "$status"
+    ENTRY_STATUS_CACHE["$key"]="$status"
+  else
+    unset_option "$(meta_option_key "$pane_id" status)"
+    unset "ENTRY_STATUS_CACHE[$key]"
+  fi
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_status_text() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_STATUS_TEXT_CACHE[$key]:-}"
+}
+
+remember_entry_status_text() {
+  local pane_id="$1"
+  local text="$2"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  text="${text//$'\t'/ }"
+  text="${text//$'\n'/ }"
+  if [[ -n "$text" ]]; then
+    set_option "$(meta_option_key "$pane_id" status_text)" "$text"
+    ENTRY_STATUS_TEXT_CACHE["$key"]="$text"
+  else
+    unset_option "$(meta_option_key "$pane_id" status_text)"
+    unset "ENTRY_STATUS_TEXT_CACHE[$key]"
+  fi
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_last_done() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_LAST_DONE_CACHE[$key]:-}"
+}
+
+remember_entry_last_done() {
+  local pane_id="$1"
+  local value="$2"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+  if [[ -n "$value" ]]; then
+    set_option "$(meta_option_key "$pane_id" last_done)" "$value"
+    ENTRY_LAST_DONE_CACHE["$key"]="$value"
+  else
+    unset_option "$(meta_option_key "$pane_id" last_done)"
+    unset "ENTRY_LAST_DONE_CACHE[$key]"
+  fi
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+stored_entry_branch() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_BRANCH_VALUE_CACHE[$key]:-}"
+}
+
+stored_entry_branch_path() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_BRANCH_PATH_CACHE[$key]:-}"
+}
+
+stored_entry_branch_checked() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  load_session_metadata_cache
+  echo "${ENTRY_BRANCH_CHECKED_CACHE[$key]:-}"
+}
+
+remember_entry_branch_cache() {
+  local pane_id="$1"
+  local path="$2"
+  local branch="$3"
+  local checked="$4"
+  local key
+  [[ -n "$pane_id" ]] || return 0
+  key="$(metadata_cache_key "$pane_id")"
+
+  if [[ -n "$branch" ]]; then
+    set_option "$(meta_option_key "$pane_id" branch)" "$branch"
+    ENTRY_BRANCH_VALUE_CACHE["$key"]="$branch"
+  else
+    unset_option "$(meta_option_key "$pane_id" branch)"
+    unset "ENTRY_BRANCH_VALUE_CACHE[$key]"
+  fi
+
+  if [[ -n "$path" ]]; then
+    set_option "$(meta_option_key "$pane_id" branch_path)" "$path"
+    ENTRY_BRANCH_PATH_CACHE["$key"]="$path"
+  else
+    unset_option "$(meta_option_key "$pane_id" branch_path)"
+    unset "ENTRY_BRANCH_PATH_CACHE[$key]"
+  fi
+
+  if [[ -n "$checked" ]]; then
+    set_option "$(meta_option_key "$pane_id" branch_checked)" "$checked"
+    ENTRY_BRANCH_CHECKED_CACHE["$key"]="$checked"
+  else
+    unset_option "$(meta_option_key "$pane_id" branch_checked)"
+    unset "ENTRY_BRANCH_CHECKED_CACHE[$key]"
+  fi
+
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+clear_entry_branch_cache() {
+  local pane_id="$1"
+  local key
+  key="$(metadata_cache_key "$pane_id")"
+  unset_option "$(meta_option_key "$pane_id" branch)"
+  unset_option "$(meta_option_key "$pane_id" branch_path)"
+  unset_option "$(meta_option_key "$pane_id" branch_checked)"
+  unset "ENTRY_BRANCH_VALUE_CACHE[$key]"
+  unset "ENTRY_BRANCH_PATH_CACHE[$key]"
+  unset "ENTRY_BRANCH_CHECKED_CACHE[$key]"
+  SESSION_METADATA_CACHE_LOADED=1
+}
+
+clear_entry_metadata() {
+  local pane_id="$1"
+  clear_entry_label "$pane_id"
+  remember_entry_kind "$pane_id" ""
+  remember_entry_provider "$pane_id" ""
+  remember_entry_status "$pane_id" ""
+  remember_entry_status_text "$pane_id" ""
+  remember_entry_last_done "$pane_id" ""
+  clear_entry_branch_cache "$pane_id"
+}
+
+valid_entry_kind() {
+  local kind="$1"
+  [[ "$kind" == "agent" || "$kind" == "pane" ]]
+}
+
+valid_entry_provider() {
+  local provider="$1"
+  [[ "$provider" == "pi" || "$provider" == "codex" || "$provider" == "claude" || "$provider" == "shell" || "$provider" == "unknown" ]]
+}
+
+valid_entry_status() {
+  local status="$1"
+  [[ "$status" == "idle" || "$status" == "running" || "$status" == "tool" || "$status" == "done" || "$status" == "error" || "$status" == "unknown" ]]
+}
+
+is_shell_command() {
+  local command="${1,,}"
+  [[ "$command" == "zsh" || "$command" == "bash" || "$command" == "fish" || "$command" == "sh" || "$command" == "tmux" ]]
+}
+
+entry_in_agent_order() {
+  local name="$1"
+  local existing
+  for existing in $(agent_order_string); do
+    [[ "$existing" == "$name" ]] && return 0
+  done
+  return 1
+}
+
+detect_provider_from_text() {
+  local text="${1,,}"
+  if [[ "$text" == *"π"* || "$text" == *"pi-coding-agent"* || "$text" =~ (^|[^[:alnum:]])pi([^[:alnum:]]|$) ]]; then
+    echo "pi"
+    return
+  fi
+  if [[ "$text" == *"codex"* ]]; then
+    echo "codex"
+    return
+  fi
+  if [[ "$text" == *"claude"* ]]; then
+    echo "claude"
+    return
+  fi
+}
+
+resolve_entry_provider() {
+  local stored_provider="$1"
+  local stored_kind="$2"
+  local label="$3"
+  local pane_title="$4"
+  local pane_command="$5"
+  local provider
+
+  if valid_entry_provider "$stored_provider"; then
+    echo "$stored_provider"
+    return
+  fi
+
+  provider="$(detect_provider_from_text "$label $pane_title $pane_command")"
+  if [[ -n "$provider" ]]; then
+    echo "$provider"
+    return
+  fi
+
+  if [[ "$stored_kind" == "agent" ]]; then
+    echo "unknown"
+    return
+  fi
+
+  if is_shell_command "$pane_command"; then
+    echo "shell"
+    return
+  fi
+
+  echo "unknown"
+}
+
+resolve_entry_kind() {
+  local stored_kind="$1"
+  local provider="$2"
+  local label="$3"
+  local pane_title="$4"
+  local pane_command="$5"
+  local lowered
+
+  if valid_entry_kind "$stored_kind"; then
+    echo "$stored_kind"
+    return
+  fi
+
+  if [[ "$provider" == "pi" || "$provider" == "codex" || "$provider" == "claude" ]]; then
+    echo "agent"
+    return
+  fi
+
+  if entry_in_agent_order "$label"; then
+    echo "agent"
+    return
+  fi
+
+  lowered="${label,,} ${pane_title,,} ${pane_command,,}"
+  if [[ "$lowered" == *"agent"* || "$lowered" == *"orchestrator"* ]]; then
+    echo "agent"
+    return
+  fi
+
+  echo "pane"
+}
+
+derive_entry_label() {
+  local stored_label="$1"
+  local provider="$2"
+  local pane_title="$3"
+  local pane_folder="$4"
+  local pane_branch="$5"
+  local pane_command="$6"
+  local pane_id="$7"
+  local label trimmed
+
+  if [[ -n "$stored_label" ]]; then
+    if [[ -n "$pane_folder" && "$stored_label" == */"$pane_folder" ]]; then
+      echo "$pane_folder"
+      return
+    fi
+    if [[ "$provider" != "pi" || "$stored_label" != "$pane_title" ]]; then
+      echo "$stored_label"
+      return
+    fi
+  fi
+
+  if [[ "$provider" == "pi" && "$pane_title" == "π - "* ]]; then
+    echo "${pane_title#π - }"
+    return
+  fi
+
+  if [[ "$provider" == "pi" && "$pane_title" == "pi - "* ]]; then
+    echo "${pane_title#pi - }"
+    return
+  fi
+
+  if [[ "$provider" == "pi" && -n "$pane_folder" ]]; then
+    echo "$pane_folder"
+    return
+  fi
+
+  if [[ ( "$provider" == "codex" || "$provider" == "claude" ) && -n "$pane_title" ]]; then
+    echo "$pane_title"
+    return
+  fi
+
+  trimmed="$pane_title"
+  if [[ -n "$trimmed" && "$trimmed" != "$HOST_FULL" && "$trimmed" != "$HOST_SHORT" && ! "$trimmed" =~ \.local$ ]]; then
+    echo "$trimmed"
+    return
+  fi
+
+  label="$pane_folder"
+  if [[ -n "$pane_branch" ]]; then
+    label+="@$pane_branch"
+  fi
+  if [[ -n "$label" ]]; then
+    echo "$label"
+    return
+  fi
+
+  if [[ -n "$pane_command" ]]; then
+    echo "${pane_command}-${pane_id#%}"
+    return
+  fi
+
+  echo "pane-${pane_id#%}"
+}
+
+effective_entry_status() {
+  local pane_id="$1"
+  local kind="$2"
+  local status last_done ttl now age
+
+  status="$(stored_entry_status "$pane_id")"
+  if [[ -n "$status" ]] && ! valid_entry_status "$status"; then
+    status=""
+  fi
+
+  if [[ "$status" == "done" ]]; then
+    last_done="$(stored_entry_last_done "$pane_id")"
+    ttl="$(done_status_ttl)"
+    now="$(date +%s)"
+    if [[ "$last_done" =~ ^[0-9]+$ && "$ttl" =~ ^[0-9]+$ ]]; then
+      age=$((now - last_done))
+      if ((age > ttl)); then
+        status="idle"
+      fi
+    fi
+  fi
+
+  if [[ -z "$status" && "$kind" == "agent" ]]; then
+    status="idle"
+  fi
+
+  echo "$status"
+}
+
+path_label() {
+  local path="$1"
+  basename "$path" 2>/dev/null || true
+}
+
+git_branch_for_pane() {
+  local pane_id="$1"
+  local path="$2"
+  local branch="" cached_path cached_branch cached_checked now
+
+  [[ -n "$pane_id" ]] || return 0
+  [[ -n "$path" && -d "$path" ]] || return 0
+
+  cached_path="$(stored_entry_branch_path "$pane_id")"
+  cached_branch="$(stored_entry_branch "$pane_id")"
+  cached_checked="$(stored_entry_branch_checked "$pane_id")"
+  now="$(date +%s)"
+
+  if [[ "$cached_path" == "$path" && "$cached_checked" =~ ^[0-9]+$ ]]; then
+    if (( now - cached_checked < BRANCH_CACHE_TTL )); then
+      echo "$cached_branch"
+      return 0
+    fi
+  fi
+
+  if [[ -v "GIT_BRANCH_CACHE[$path]" ]]; then
+    branch="${GIT_BRANCH_CACHE[$path]}"
+  elif command -v git >/dev/null 2>&1; then
+    branch="$(git -C "$path" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$path" rev-parse --short HEAD 2>/dev/null || true)"
+    GIT_BRANCH_CACHE["$path"]="$branch"
+  fi
+
+  remember_entry_branch_cache "$pane_id" "$path" "$branch" "$now"
+  echo "$branch"
+}
+
+label_in_use_by_other_pane() {
+  local pane_id="$1"
+  local target_label="$2"
+  local line label existing_pane_id
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label existing_pane_id _rest <<<"$line"
+    if [[ "$label" == "$target_label" && "$existing_pane_id" != "$pane_id" ]]; then
+      return 0
+    fi
+  done < <(discover_entries)
+
+  return 1
+}
+
+unique_entry_label_for_pane() {
+  local pane_id="$1"
+  local base="$2"
+  local candidate="$base"
+  local suffix=2
+
+  while label_in_use_by_other_pane "$pane_id" "$candidate"; do
+    candidate="${base}-${suffix}"
+    suffix=$((suffix + 1))
+  done
+
+  echo "$candidate"
+}
+
+collect_entry_lines() {
+  local sidebar_pane store_session line session_id window_id window_name pane_id pane_dead pane_title pane_command pane_path pane_folder pane_branch
+  local stored_label stored_kind stored_provider label base_label provider kind status status_text last_done suffix key
+  local cached_path cached_branch cached_checked now age
+  local -A seen_labels=()
+
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  store_session="$(store_session_id)"
+  load_session_metadata_cache
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r session_id window_id window_name pane_id pane_dead pane_title pane_command pane_path <<<"$line"
+    if [[ "$session_id" != "$SESSION_ID" ]]; then
+      [[ -n "$store_session" && "$session_id" == "$store_session" ]] || continue
+    fi
+    [[ "$pane_dead" == "1" ]] && continue
+    [[ "$pane_id" == "$sidebar_pane" ]] && continue
+    is_internal_pane_title "$pane_title" && continue
+
+    key="${pane_id#%}"
+    pane_folder="$(path_label "$pane_path")"
+    stored_label="${ENTRY_LABEL_CACHE[$key]:-}"
+    stored_kind="${ENTRY_KIND_CACHE[$key]:-}"
+    stored_provider="${ENTRY_PROVIDER_CACHE[$key]:-}"
+
+    pane_branch=""
+    if [[ -n "$pane_path" && -d "$pane_path" ]]; then
+      cached_path="${ENTRY_BRANCH_PATH_CACHE[$key]:-}"
+      cached_branch="${ENTRY_BRANCH_VALUE_CACHE[$key]:-}"
+      cached_checked="${ENTRY_BRANCH_CHECKED_CACHE[$key]:-}"
+      now="$(date +%s)"
+      if [[ "$cached_path" == "$pane_path" && "$cached_checked" =~ ^[0-9]+$ ]]; then
+        age=$((now - cached_checked))
+      else
+        age=$BRANCH_CACHE_TTL
+      fi
+
+      if (( age < BRANCH_CACHE_TTL )); then
+        pane_branch="$cached_branch"
+      else
+        if [[ -v "GIT_BRANCH_CACHE[$pane_path]" ]]; then
+          pane_branch="${GIT_BRANCH_CACHE[$pane_path]}"
+        elif command -v git >/dev/null 2>&1; then
+          pane_branch="$(git -C "$pane_path" symbolic-ref --quiet --short HEAD 2>/dev/null || git -C "$pane_path" rev-parse --short HEAD 2>/dev/null || true)"
+          GIT_BRANCH_CACHE["$pane_path"]="$pane_branch"
+        fi
+        remember_entry_branch_cache "$pane_id" "$pane_path" "$pane_branch" "$now"
+      fi
+    fi
+
+    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "$stored_label" "$pane_title" "$pane_command")"
+    base_label="$(derive_entry_label "$stored_label" "$provider" "$pane_title" "$pane_folder" "$pane_branch" "$pane_command" "$pane_id")"
+    label="$base_label"
+
+    if [[ -z "$stored_label" ]]; then
+      if [[ -n "${seen_labels[$label]:-}" && "${seen_labels[$label]}" != "$pane_id" ]]; then
+        label="${base_label}-${pane_id#%}"
+      fi
+    else
+      suffix=2
+      while [[ -n "${seen_labels[$label]:-}" && "${seen_labels[$label]}" != "$pane_id" ]]; do
+        label="${base_label}-${suffix}"
+        suffix=$((suffix + 1))
+      done
+    fi
+    seen_labels["$label"]="$pane_id"
+
+    if [[ -n "$stored_label" && "$label" != "$stored_label" ]]; then
+      remember_entry_label "$pane_id" "$label"
+      stored_label="$label"
+    fi
+    kind="$(resolve_entry_kind "$stored_kind" "$provider" "$label" "$pane_title" "$pane_command")"
+    status="$(effective_entry_status "$pane_id" "$kind")"
+    status_text="${ENTRY_STATUS_TEXT_CACHE[$key]:-}"
+    [[ "$status" == "tool" ]] || status_text=""
+    last_done="${ENTRY_LAST_DONE_CACHE[$key]:-}"
+
+    printf "%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s${DELIM}%s\n" \
+      "$label" "$pane_id" "$window_id" "$window_name" "$kind" "$provider" "$status" "$status_text" "$pane_command" "$pane_folder" "$pane_branch" "$last_done"
+  done < <(tmux list-panes -a -F "#{session_id}${DELIM}#{window_id}${DELIM}#{window_name}${DELIM}#{pane_id}${DELIM}#{pane_dead}${DELIM}#{pane_title}${DELIM}#{pane_current_command}${DELIM}#{pane_current_path}")
+}
+
+discover_entries() {
+  collect_entry_lines
+}
+
+ordered_entry_lines() {
+  local -a lines agent_records pane_records
+  local -A order_index
+  local line label _pane_id _window_id _window_name kind sort_label priority sequence
+
+  lines=()
+  agent_records=()
+  pane_records=()
+
+  mapfile -t lines < <(discover_entries)
+  sequence=0
+  for label in $(agent_order_string); do
+    order_index["$label"]="$sequence"
+    sequence=$((sequence + 1))
+  done
+
+  sequence=0
+  for line in "${lines[@]}"; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label _pane_id _window_id _window_name kind _rest <<<"$line"
+    sort_label="${label,,}"
+    if [[ "$kind" == "agent" ]]; then
+      priority="${order_index[$label]:-9999}"
+      agent_records+=("$(printf '%08d%s%s%s%08d%s%s' "$priority" "$DELIM" "$sort_label" "$DELIM" "$sequence" "$DELIM" "$line")")
+    else
+      pane_records+=("$(printf '%s%s%08d%s%s' "$sort_label" "$DELIM" "$sequence" "$DELIM" "$line")")
+    fi
+    sequence=$((sequence + 1))
+  done
+
+  if ((${#agent_records[@]} > 0)); then
+    printf '%s\n' "${agent_records[@]}" | sort -t "$DELIM" -k1,1n -k2,2 -k3,3n | cut -d "$DELIM" -f4-
+  fi
+  if ((${#pane_records[@]} > 0)); then
+    printf '%s\n' "${pane_records[@]}" | sort -t "$DELIM" -k1,1 -k2,2n | cut -d "$DELIM" -f3-
+  fi
+}
+
+ordered_agent_lines() {
+  ordered_entry_lines | awk -F "$DELIM" '$5 == "agent" { print }'
+}
+
+ordered_pane_lines() {
+  ordered_entry_lines | awk -F "$DELIM" '$5 != "agent" { print }'
+}
+
+ordered_agent_names() {
+  ordered_agent_lines | cut -d "$DELIM" -f1
+}
+
+ordered_entry_names() {
+  ordered_entry_lines | cut -d "$DELIM" -f1
+}
+
+entry_pane_by_name() {
+  local target="$1"
+  local matches=()
+  local line label pane_id _rest
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label pane_id _rest <<<"$line"
+    if [[ "$label" == "$target" ]]; then
+      matches+=("$pane_id")
+    fi
+  done < <(discover_entries)
+
+  if ((${#matches[@]} == 0)); then
+    return 1
+  fi
+  if ((${#matches[@]} > 1)); then
+    fail "multiple panes found for entry '$target'"
+  fi
+
+  echo "${matches[0]}"
+}
+
+first_entry_name() {
+  ordered_entry_names | head -n1
+}
+
+current_entry_name() {
+  local pane_id label line
+  pane_id="$(current_pane_id)"
+  label="$(stored_entry_label "$pane_id")"
+  if [[ -n "$label" ]]; then
+    echo "$label"
+    return
+  fi
+  line="$(discover_entries | awk -F "$DELIM" -v pane="$pane_id" '$2 == pane { print; exit }')"
+  if [[ -n "$line" ]]; then
+    echo "${line%%$DELIM*}"
+  fi
+}
+
+normalize_label_token() {
+  local value="$1"
+  value="${value// /-}"
+  value="${value//$'\t'/-}"
+  value="${value//\//-}"
+  value="${value//:/-}"
+  value="${value//[^[:alnum:]_.@+-]/-}"
+  while [[ "$value" == *--* ]]; do
+    value="${value//--/-}"
+  done
+  value="${value#-}"
+  value="${value%-}"
+  echo "$value"
+}
+
+derive_label_for_new_pane() {
+  local pane_id="$1"
+  local pane_path path_base git_branch command label
+  pane_path="$(tmux display-message -p -t "$pane_id" '#{pane_current_path}')"
+  path_base="$(path_label "$pane_path")"
+  git_branch="$(git_branch_for_pane "$pane_id" "$pane_path")"
+  command="$(tmux display-message -p -t "$pane_id" '#{pane_current_command}')"
+
+  path_base="$(normalize_label_token "$path_base")"
+  git_branch="$(normalize_label_token "$git_branch")"
+  command="$(normalize_label_token "$command")"
+
+  if [[ -n "$path_base" && -n "$git_branch" ]]; then
+    label="${path_base}-${git_branch}"
+  elif [[ -n "$path_base" ]]; then
+    label="$path_base"
+  elif [[ -n "$command" ]]; then
+    label="$command"
+  else
+    label="pane"
+  fi
+
+  unique_entry_label_for_pane "$pane_id" "$label"
+}
+
+append_agent_order() {
+  local label="$1"
+  local order existing
+  order="$(get_option @agents_sidebar_order)"
+  if [[ -z "$order" ]]; then
+    set_option @agents_sidebar_order "$label"
+    return
+  fi
+  for existing in $order; do
+    [[ "$existing" == "$label" ]] && return
+  done
+  set_option @agents_sidebar_order "$order $label"
+}
+
+cleanup_store_state() {
+  local store_session store_window
+  store_session="$(store_session_id)"
+  store_window="$(store_window_id)"
+
+  if [[ -n "$store_session" ]] && ! session_exists "$store_session"; then
+    clear_store_state
+    return 0
+  fi
+
+  if [[ -n "$store_window" ]] && ! window_exists "$store_window"; then
+    clear_store_state
+  fi
+}
+
+cleanup_dead_panes() {
+  local line session_id pane_id pane_dead pane_title _window_name store_session cleaned=0 key
+  store_session="$(store_session_id)"
+  load_session_metadata_cache
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r session_id pane_id pane_dead pane_title _window_name <<<"$line"
+    if [[ "$session_id" != "$SESSION_ID" ]]; then
+      [[ -n "$store_session" && "$session_id" == "$store_session" ]] || continue
+    fi
+    [[ "$pane_dead" == "1" ]] || continue
+    key="${pane_id#%}"
+    if [[ -n "${ENTRY_LABEL_CACHE[$key]:-}" || -n "${ENTRY_KIND_CACHE[$key]:-}" || -n "${ENTRY_PROVIDER_CACHE[$key]:-}" || "$pane_title" == __agents_sidebar_* ]]; then
+      clear_entry_metadata "$pane_id"
+      tmux kill-pane -t "$pane_id" 2>/dev/null || true
+      cleaned=1
+    fi
+  done < <(tmux list-panes -a -F "#{session_id}${DELIM}#{pane_id}${DELIM}#{pane_dead}${DELIM}#{pane_title}${DELIM}#{window_name}")
+
+  local focus_pane sidebar_pane
+  focus_pane="$(get_option @agents_sidebar_focus_pane)"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  if [[ -n "$focus_pane" ]] && ! pane_exists "$focus_pane"; then
+    unset_option @agents_sidebar_focus_pane
+  fi
+  if [[ -n "$sidebar_pane" ]] && ! pane_exists "$sidebar_pane"; then
+    unset_option @agents_sidebar_pane
+  fi
+
+  cleanup_store_state
+
+  if [[ "$cleaned" == "1" ]]; then
+    bump_epoch
+  fi
+}
+
+sidebar_command() {
+  local log_file="$HOME/.tmux/agents-sidebar.log"
+  printf "python3 %q --session %q --controller %q 2>> %q" "$SIDEBAR_SCRIPT" "$SESSION_ID" "$SCRIPT_DIR/agents-sidebar" "$log_file"
+}
+
+create_sidebar_pane() {
+  local target_pane="$1"
+  local width="$2"
+  local compact_window="$3"
+  local sidebar_pane
+
+  tmux set-option -w -t "$compact_window" remain-on-exit off >/dev/null 2>&1 || true
+  sidebar_pane="$(tmux split-window -d -h -b -l "$width" -t "$target_pane" -P -F '#{pane_id}')"
+  tmux select-pane -t "$sidebar_pane" -T '__agents_sidebar_nav'
+  echo "$sidebar_pane"
+}
+
+start_sidebar() {
+  local sidebar_pane="$1"
+  local compact_window="$2"
+  : > "$HOME/.tmux/agents-sidebar.log"
+  tmux set-option -w -t "$compact_window" remain-on-exit off >/dev/null 2>&1 || true
+  tmux select-window -t "$compact_window"
+  tmux respawn-pane -k -t "$sidebar_pane" "$(sidebar_command)"
+}
+
+ensure_sidebar() {
+  local compact_window focus_pane sidebar_pane width
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  focus_pane="$(get_option @agents_sidebar_focus_pane)"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+
+  [[ -n "$compact_window" ]] || fail "compact window is missing"
+  window_exists "$compact_window" || fail "compact window no longer exists"
+  [[ -n "$focus_pane" ]] || fail "focus pane is missing"
+  pane_exists "$focus_pane" || fail "focus pane no longer exists"
+
+  if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
+    if pane_is_dead "$sidebar_pane"; then
+      start_sidebar "$sidebar_pane" "$compact_window"
+    fi
+    return 0
+  fi
+
+  width="$(sidebar_width)"
+  sidebar_pane="$(create_sidebar_pane "$focus_pane" "$width" "$compact_window")"
+  set_option @agents_sidebar_pane "$sidebar_pane"
+  start_sidebar "$sidebar_pane" "$compact_window"
+  bump_epoch
+}
+
+choose_active_name_for_compact() {
+  local current_name chosen
+  current_name="$(current_entry_name)"
+  if [[ -n "$current_name" ]] && entry_pane_by_name "$current_name" >/dev/null 2>&1; then
+    echo "$current_name"
+    return
+  fi
+
+  chosen="$(get_option @agents_sidebar_active_name)"
+  if [[ -n "$chosen" ]] && entry_pane_by_name "$chosen" >/dev/null 2>&1; then
+    echo "$chosen"
+    return
+  fi
+
+  chosen="$(first_entry_name)"
+  [[ -n "$chosen" ]] || fail "no managed panes found"
+  echo "$chosen"
+}
+
+cmd_compact() {
+  local mode wide_name width compact_window sidebar_pane active_name active_pane active_session active_path active_window_name
+  local host_placeholder old_sidebar
+  local -a entry_lines
+  local line label pane_id _window_id _window_name _kind
+
+  cleanup_dead_panes
+  mode="$(get_option @agents_sidebar_mode)"
+  if [[ "$mode" == 'compact' ]]; then
+    compact_window="$(get_option @agents_sidebar_compact_window)"
+    if [[ -z "$compact_window" ]] || ! window_exists "$compact_window"; then
+      cmd_wide >/dev/null
+    else
+      cmd_refresh >/dev/null
+      ensure_sidebar
+      tmux select-window -t "$compact_window"
+      tmux select-pane -t "$(get_option @agents_sidebar_focus_pane)"
+      return
+    fi
+  fi
+
+  mapfile -t entry_lines < <(ordered_entry_lines)
+  ((${#entry_lines[@]} > 0)) || fail "no managed panes found in session $SESSION_ID"
+
+  wide_name="$(current_window_name)"
+  if is_internal_window_name "$wide_name"; then
+    wide_name="$(wide_window_name_default)"
+  fi
+  wide_name="${wide_name:-$(wide_window_name_default)}"
+  width="$(sidebar_width)"
+  active_name="$(choose_active_name_for_compact)"
+  active_pane="$(entry_pane_by_name "$active_name")"
+  active_session="$(pane_session_id "$active_pane")"
+  active_window_name="$(tmux display-message -p -t "$active_pane" '#{window_name}')"
+
+  if [[ "$active_session" == "$SESSION_ID" ]] && ! is_internal_window_name "$active_window_name"; then
+    compact_window="$(pane_window_id "$active_pane")"
+  else
+    compact_window="$(tmux new-window -d -P -F '#{window_id}' -t "$SESSION_ID" -n "$wide_name")"
+    host_placeholder="$(tmux list-panes -t "$compact_window" -F '#{pane_id}' | head -n1)"
+    tmux select-pane -t "$host_placeholder" -T '__agents_sidebar_focus_placeholder' >/dev/null 2>&1 || true
+    tmux join-pane -d -s "$active_pane" -t "$host_placeholder"
+    tmux kill-pane -t "$host_placeholder"
+  fi
+
+  active_path="$(tmux display-message -p -t "$active_pane" '#{pane_current_path}')"
+  ensure_store_window "$active_path" >/dev/null
+
+  old_sidebar="$(get_option @agents_sidebar_pane)"
+  if [[ -n "$old_sidebar" ]] && pane_exists "$old_sidebar"; then
+    remember_sidebar_width "$old_sidebar"
+    tmux kill-pane -t "$old_sidebar" 2>/dev/null || true
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label pane_id _window_id _window_name _kind _rest <<<"$line"
+    remember_entry_label "$pane_id" "$label"
+    [[ "$pane_id" == "$active_pane" ]] && continue
+    tmux join-pane -d -s "$pane_id" -t "$(store_target_pane)"
+  done < <(printf '%s\n' "${entry_lines[@]}")
+
+  sidebar_pane="$(create_sidebar_pane "$active_pane" "$width" "$compact_window")"
+  remember_entry_label "$active_pane" "$active_name"
+
+  set_option @agents_sidebar_mode compact
+  set_option @agents_sidebar_compact_window "$compact_window"
+  set_option @agents_sidebar_pane "$sidebar_pane"
+  set_option @agents_sidebar_focus_pane "$active_pane"
+  set_option @agents_sidebar_active_name "$active_name"
+  set_option @agents_sidebar_last_active_name ''
+  set_option @agents_sidebar_wide_window_name "$wide_name"
+  bump_epoch
+
+  tmux select-window -t "$compact_window"
+  tmux select-pane -t "$active_pane"
+  start_sidebar "$sidebar_pane" "$compact_window"
+  tmux select-window -t "$compact_window"
+  tmux select-pane -t "$active_pane"
+}
+
+cmd_wide() {
+  local mode compact_window sidebar_pane active_pane target_window wide_name
+  local line _label pane_id _window_id _window_name
+
+  cleanup_dead_panes
+  mode="$(get_option @agents_sidebar_mode)"
+  if [[ "$mode" != 'compact' ]]; then
+    kill_store_session
+    tmux select-layout even-horizontal >/dev/null 2>&1 || true
+    set_option @agents_sidebar_mode wide
+    return
+  fi
+
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  active_pane="$(get_option @agents_sidebar_focus_pane)"
+  wide_name="$(get_option @agents_sidebar_wide_window_name)"
+  wide_name="${wide_name:-$(wide_window_name_default)}"
+  target_window="$compact_window"
+
+  if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
+    remember_sidebar_width "$sidebar_pane"
+    tmux kill-pane -t "$sidebar_pane"
+  fi
+
+  if [[ -z "$target_window" ]] || ! window_exists "$target_window"; then
+    target_window="$(tmux new-window -d -P -F '#{window_id}' -t "$SESSION_ID" -n "$wide_name")"
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r _label pane_id _window_id _window_name _rest <<<"$line"
+    [[ "$target_window" == "$_window_id" ]] && continue
+    tmux join-pane -d -s "$pane_id" -t "$target_window"
+  done < <(discover_entries)
+
+  kill_store_session
+
+  if [[ -n "$target_window" ]] && window_exists "$target_window"; then
+    tmux rename-window -t "$target_window" "$wide_name" >/dev/null 2>&1 || true
+    tmux select-window -t "$target_window"
+    if [[ -n "$active_pane" ]] && pane_exists "$active_pane"; then
+      tmux select-pane -t "$active_pane"
+    fi
+    tmux select-layout -t "$target_window" even-horizontal >/dev/null 2>&1 || true
+  fi
+
+  set_option @agents_sidebar_mode wide
+  bump_epoch
+  unset_option @agents_sidebar_compact_window
+  unset_option @agents_sidebar_pane
+  unset_option @agents_sidebar_focus_pane
+  unset_option @agents_sidebar_last_active_name
+}
+
+cmd_focus() {
+  local target="$1"
+  local mode current_active_name current_active_pane target_pane compact_window
+
+  cleanup_dead_panes
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" == 'compact' ]] || fail "focus only works in compact mode"
+
+  current_active_name="$(get_option @agents_sidebar_active_name)"
+  current_active_pane="$(get_option @agents_sidebar_focus_pane)"
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  target_pane="$(entry_pane_by_name "$target")"
+
+  if [[ "$target" == "$current_active_name" ]]; then
+    tmux select-window -t "$compact_window"
+    tmux select-pane -t "$target_pane"
+    return
+  fi
+
+  [[ -n "$current_active_pane" ]] || fail "missing active focus pane state"
+  pane_exists "$current_active_pane" || fail "active focus pane is gone"
+
+  tmux swap-pane -d -s "$target_pane" -t "$current_active_pane"
+
+  set_option @agents_sidebar_last_active_name "$current_active_name"
+  set_option @agents_sidebar_active_name "$target"
+  set_option @agents_sidebar_focus_pane "$target_pane"
+  bump_epoch
+
+  tmux select-window -t "$compact_window"
+  tmux select-pane -t "$target_pane"
+}
+
+cmd_focus_keep_sidebar() {
+  local target="$1"
+  local sidebar_pane compact_window
+  cmd_focus "$target"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  if [[ -n "$sidebar_pane" && -n "$compact_window" ]]; then
+    tmux select-window -t "$compact_window"
+    tmux select-pane -t "$sidebar_pane"
+  fi
+}
+
+cmd_next_prev() {
+  local direction="$1"
+  local active_name current_index names_count next_index
+  local -a names
+
+  mapfile -t names < <(ordered_entry_names)
+  names_count="${#names[@]}"
+  ((names_count > 0)) || fail "no managed panes found"
+
+  active_name="$(get_option @agents_sidebar_active_name)"
+  current_index=0
+  for i in "${!names[@]}"; do
+    if [[ "${names[$i]}" == "$active_name" ]]; then
+      current_index="$i"
+      break
+    fi
+  done
+
+  if [[ "$direction" == 'next' ]]; then
+    next_index=$(((current_index + 1) % names_count))
+  else
+    next_index=$(((current_index - 1 + names_count) % names_count))
+  fi
+
+  cmd_focus "${names[$next_index]}"
+}
+
+cmd_next_prev_keep_sidebar() {
+  local direction="$1"
+  local active_name current_index names_count next_index
+  local -a names
+
+  mapfile -t names < <(ordered_entry_names)
+  names_count="${#names[@]}"
+  ((names_count > 0)) || fail "no managed panes found"
+
+  active_name="$(get_option @agents_sidebar_active_name)"
+  current_index=0
+  for i in "${!names[@]}"; do
+    if [[ "${names[$i]}" == "$active_name" ]]; then
+      current_index="$i"
+      break
+    fi
+  done
+
+  if [[ "$direction" == 'next' ]]; then
+    next_index=$(((current_index + 1) % names_count))
+  else
+    next_index=$(((current_index - 1 + names_count) % names_count))
+  fi
+
+  cmd_focus_keep_sidebar "${names[$next_index]}"
+}
+
+cmd_toggle_last() {
+  local last_active
+  last_active="$(get_option @agents_sidebar_last_active_name)"
+  [[ -n "$last_active" ]] || fail "no previous entry recorded"
+  cmd_focus "$last_active"
+}
+
+cmd_focus_sidebar() {
+  local sidebar_pane compact_window
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  [[ -n "$sidebar_pane" ]] || fail "sidebar pane is not available"
+  ensure_sidebar
+  tmux select-window -t "$compact_window"
+  tmux select-pane -t "$sidebar_pane"
+}
+
+cmd_focus_right() {
+  local compact_window focus_pane
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  focus_pane="$(get_option @agents_sidebar_focus_pane)"
+  [[ -n "$focus_pane" ]] || fail "focus pane is not available"
+  tmux select-window -t "$compact_window"
+  tmux select-pane -t "$focus_pane"
+}
+
+refresh_active_state() {
+  local mode active_name active_pane
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" == 'compact' ]] || return 0
+
+  active_name="$(get_option @agents_sidebar_active_name)"
+  if [[ -z "$active_name" ]] || ! active_pane="$(entry_pane_by_name "$active_name" 2>/dev/null)"; then
+    active_name="$(first_entry_name)"
+    [[ -n "$active_name" ]] || fail "no managed panes available"
+    active_pane="$(entry_pane_by_name "$active_name")"
+    set_option @agents_sidebar_active_name "$active_name"
+    bump_epoch
+  fi
+  set_option @agents_sidebar_focus_pane "$active_pane"
+}
+
+cmd_repair() {
+  local mode compact_window focus_pane first_name first_pane
+  with_repair_lock || return 0
+  cleanup_dead_panes
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" == 'compact' ]] || return 0
+
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  focus_pane="$(get_option @agents_sidebar_focus_pane)"
+
+  if [[ -n "$compact_window" ]] && window_exists "$compact_window" && [[ -n "$focus_pane" ]] && pane_exists "$focus_pane"; then
+    ensure_sidebar
+    refresh_active_state >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  first_name="$(first_entry_name)"
+  if [[ -z "$first_name" ]]; then
+    kill_store_session
+    set_option @agents_sidebar_mode wide
+    unset_option @agents_sidebar_compact_window
+    unset_option @agents_sidebar_pane
+    unset_option @agents_sidebar_focus_pane
+    bump_epoch
+    return 0
+  fi
+
+  first_pane="$(entry_pane_by_name "$first_name")"
+  if [[ -n "$(get_option @agents_sidebar_pane)" ]] && pane_exists "$(get_option @agents_sidebar_pane)"; then
+    remember_sidebar_width "$(get_option @agents_sidebar_pane)"
+    tmux kill-pane -t "$(get_option @agents_sidebar_pane)" 2>/dev/null || true
+  fi
+  set_option @agents_sidebar_mode wide
+  unset_option @agents_sidebar_compact_window
+  unset_option @agents_sidebar_pane
+  unset_option @agents_sidebar_focus_pane
+  AGENTS_SIDEBAR_PANE="$first_pane" cmd_compact
+}
+
+cmd_kill_current() {
+  local target_pane mode sidebar_pane focus_pane label next_name
+  mode="$(get_option @agents_sidebar_mode)"
+  target_pane="$(current_pane_id)"
+
+  if [[ "$mode" == 'compact' ]]; then
+    sidebar_pane="$(get_option @agents_sidebar_pane)"
+    focus_pane="$(get_option @agents_sidebar_focus_pane)"
+    if [[ -n "$sidebar_pane" && "$target_pane" == "$sidebar_pane" ]]; then
+      target_pane="$focus_pane"
+    fi
+
+    if [[ -n "$focus_pane" && "$target_pane" == "$focus_pane" ]]; then
+      label="$(stored_entry_label "$target_pane")"
+      next_name="$(ordered_entry_names | grep -Fxv "$label" | head -n1 || true)"
+      if [[ -n "$next_name" ]]; then
+        cmd_focus "$next_name"
+      else
+        cmd_wide >/dev/null 2>&1 || true
+      fi
+    fi
+  fi
+
+  [[ -n "$target_pane" ]] || fail "no pane selected to kill"
+  pane_exists "$target_pane" || fail "target pane no longer exists"
+  clear_entry_metadata "$target_pane"
+  tmux kill-pane -t "$target_pane"
+  cleanup_dead_panes
+  refresh_active_state >/dev/null 2>&1 || true
+  if [[ "$mode" == 'compact' ]]; then
+    cmd_repair
+  fi
+}
+
+cmd_new() {
+  local mode source_pane source_path compact_window target_for_split new_pane label
+  local sidebar_pane focus_pane
+
+  cleanup_dead_panes
+  mode="$(get_option @agents_sidebar_mode)"
+  source_pane="$(current_pane_id)"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  focus_pane="$(get_option @agents_sidebar_focus_pane)"
+
+  if [[ -n "$sidebar_pane" && "$source_pane" == "$sidebar_pane" && -n "$focus_pane" ]]; then
+    source_pane="$focus_pane"
+  fi
+
+  pane_exists "$source_pane" || fail "source pane is not available"
+  source_path="$(tmux display-message -p -t "$source_pane" '#{pane_current_path}')"
+
+  if [[ "$mode" == 'compact' ]]; then
+    compact_window="$(get_option @agents_sidebar_compact_window)"
+    ensure_store_window "$source_path" >/dev/null
+    target_for_split="$(store_target_pane)"
+    new_pane="$(tmux split-window -d -h -t "$target_for_split" -c "$source_path" -P -F '#{pane_id}')"
+    label="$(derive_label_for_new_pane "$new_pane")"
+    remember_entry_label "$new_pane" "$label"
+    remember_entry_kind "$new_pane" agent
+    append_agent_order "$label"
+    bump_epoch
+    cmd_focus "$label"
+    tmux select-window -t "$compact_window"
+    tmux select-pane -t "$(get_option @agents_sidebar_focus_pane)"
+  else
+    new_pane="$(tmux split-window -h -t "$source_pane" -c "$source_path" -P -F '#{pane_id}')"
+    label="$(derive_label_for_new_pane "$new_pane")"
+    remember_entry_label "$new_pane" "$label"
+    remember_entry_kind "$new_pane" agent
+    append_agent_order "$label"
+    tmux select-layout even-horizontal >/dev/null 2>&1 || true
+    bump_epoch
+    tmux select-pane -t "$new_pane"
+  fi
+
+  echo "$label"
+}
+
+cmd_register() {
+  local pane_id="$1"
+  local label="$2"
+  [[ -n "$pane_id" && -n "$label" ]] || fail "register requires <pane-id> <label>"
+  pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
+  label="$(unique_entry_label_for_pane "$pane_id" "$label")"
+  remember_entry_label "$pane_id" "$label"
+  remember_entry_kind "$pane_id" agent
+  append_agent_order "$label"
+  bump_epoch
+}
+
+cmd_mark_agent() {
+  local pane_id="$1"
+  local maybe_provider="${2:-}"
+  local maybe_label="${3:-}"
+  local provider="unknown"
+  local label=""
+
+  pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
+  if valid_entry_provider "$maybe_provider" && [[ "$maybe_provider" != "shell" ]]; then
+    provider="$maybe_provider"
+    label="$maybe_label"
+  else
+    label="$maybe_provider"
+  fi
+
+  remember_entry_kind "$pane_id" agent
+  [[ -n "$provider" ]] && remember_entry_provider "$pane_id" "$provider"
+  if [[ -n "$label" ]]; then
+    label="$(unique_entry_label_for_pane "$pane_id" "$label")"
+    remember_entry_label "$pane_id" "$label"
+    append_agent_order "$label"
+  fi
+  bump_epoch
+}
+
+cmd_mark_pane() {
+  local pane_id="$1"
+  local label="${2:-}"
+  pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
+  remember_entry_kind "$pane_id" pane
+  if [[ -n "$label" ]]; then
+    label="$(unique_entry_label_for_pane "$pane_id" "$label")"
+    remember_entry_label "$pane_id" "$label"
+  fi
+  bump_epoch
+}
+
+cmd_set_status() {
+  local pane_id="$1"
+  local status="$2"
+  local status_text="${3:-}"
+  pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
+  valid_entry_status "$status" || fail "invalid status '$status'"
+  remember_entry_status "$pane_id" "$status"
+  if [[ "$status" == "tool" ]]; then
+    remember_entry_status_text "$pane_id" "$status_text"
+  else
+    remember_entry_status_text "$pane_id" ""
+  fi
+  if [[ "$status" == "done" ]]; then
+    remember_entry_last_done "$pane_id" "$(date +%s)"
+  elif [[ "$status" != "done" ]]; then
+    remember_entry_last_done "$pane_id" ""
+  fi
+  bump_epoch
+}
+
+cmd_clear_status() {
+  local pane_id="$1"
+  pane_exists "$pane_id" || fail "pane '$pane_id' does not exist"
+  remember_entry_status "$pane_id" ""
+  remember_entry_status_text "$pane_id" ""
+  remember_entry_last_done "$pane_id" ""
+  bump_epoch
+}
+
+emit_human_lines() {
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    echo "${line//$DELIM/$'\t'}"
+  done
+}
+
+cmd_list_entries() {
+  ordered_entry_lines | emit_human_lines
+}
+
+cmd_list_agents() {
+  ordered_agent_lines | emit_human_lines
+}
+
+cmd_snapshot() {
+  local sidebar_pane focus_pane active_name last_active_name mode epoch width height line
+
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  focus_pane="$(get_option @agents_sidebar_focus_pane)"
+  active_name="$(get_option @agents_sidebar_active_name)"
+  last_active_name="$(get_option @agents_sidebar_last_active_name)"
+  mode="$(get_option @agents_sidebar_mode)"
+  epoch="$(get_option @agents_sidebar_epoch)"
+  epoch="${epoch:-0}"
+  width=0
+  height=0
+
+  if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
+    IFS="$DELIM" read -r width height <<<"$(tmux display-message -p -t "$sidebar_pane" "#{pane_width}${DELIM}#{pane_height}")"
+  fi
+
+  printf 'mode\t%s\n' "$mode"
+  printf 'active_name\t%s\n' "$active_name"
+  printf 'last_active_name\t%s\n' "$last_active_name"
+  printf 'sidebar_pane\t%s\n' "$sidebar_pane"
+  printf 'focus_pane\t%s\n' "$focus_pane"
+  printf 'epoch\t%s\n' "$epoch"
+  printf 'size\t%s\t%s\n' "$width" "$height"
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label pane_id window_id window_name kind provider status status_text command folder branch _last_done <<<"$line"
+    printf 'entry\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$label" "$pane_id" "$window_id" "$window_name" "$kind" "$provider" "$status" "$status_text" "$folder" "$branch" "$command" "$( [[ "$label" == "$active_name" ]] && echo 1 || echo 0 )"
+  done < <(ordered_entry_lines)
+}
+
+cmd_cleanup_dead() {
+  cleanup_dead_panes
+}
+
+cmd_refresh() {
+  cleanup_dead_panes
+  refresh_active_state
+}
+
+print_section() {
+  local title="$1"
+  shift
+  local line printed=0
+  echo "$title:"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    echo "  ${line//$DELIM/$'\t'}"
+    printed=1
+  done < <("$@")
+  if [[ "$printed" == "0" ]]; then
+    echo "  —"
+  fi
+}
+
+cmd_status() {
+  cleanup_dead_panes
+  if [[ "$(get_option @agents_sidebar_mode)" != 'compact' ]]; then
+    kill_store_session
+  fi
+  echo "session: $SESSION_ID"
+  echo "mode: $(get_option @agents_sidebar_mode)"
+  echo "compact_window: $(get_option @agents_sidebar_compact_window)"
+  echo "store_session: $(get_option @agents_sidebar_store_session)"
+  echo "store_window: $(get_option @agents_sidebar_store_window)"
+  echo "sidebar_pane: $(get_option @agents_sidebar_pane)"
+  echo "focus_pane: $(get_option @agents_sidebar_focus_pane)"
+  echo "active_name: $(get_option @agents_sidebar_active_name)"
+  echo "last_active_name: $(get_option @agents_sidebar_last_active_name)"
+  echo "wide_window_name: $(get_option @agents_sidebar_wide_window_name)"
+  echo
+  print_section "agents" ordered_agent_lines
+  echo
+  print_section "panes" ordered_pane_lines
+}
+
+usage() {
+  cat <<'EOF'
+usage: agents-sidebar <command> [args]
+
+commands:
+  compact                       switch to compact sidebar layout
+  wide                          restore all managed panes into an even-horizontal wide layout
+  new                           create a new managed agent pane and auto-label it from pane context
+  kill-current                  kill the current managed pane and repair compact mode
+  repair                        repair compact mode after pane loss or stale state
+  focus <name>                  focus the named entry in compact mode
+  focus-keep-sidebar <name>     focus the named entry and keep keyboard focus in the sidebar
+  next                          focus the next entry
+  next-keep-sidebar             focus the next entry and keep keyboard focus in the sidebar
+  prev                          focus the previous entry
+  prev-keep-sidebar             focus the previous entry and keep keyboard focus in the sidebar
+  toggle-last                   jump back to the previously focused entry
+  focus-sidebar                 move keyboard focus to the sidebar pane
+  focus-right                   move keyboard focus to the active pane
+  register <pane> <name>        assign a stable label and mark the pane as an agent
+  mark-agent <pane> [provider] [label]
+                                classify a pane as an agent
+  mark-pane <pane> [label]      classify a pane as a regular pane
+  set-status <pane> <status> [text]
+                                set pane status: idle|running|tool|done|error|unknown
+  clear-status <pane>           clear pane status metadata
+  list-entries                  print all discovered entries
+  list-agents                   print discovered agent entries
+  snapshot                      print a compact sidebar state snapshot
+  cleanup-dead                  remove stale dead managed panes
+  refresh                       refresh compact-mode state
+  status                        print current state and discovered entries
+EOF
+}
+
+main() {
+  init_session
+
+  local cmd="${1:-}"
+  case "$cmd" in
+    compact)
+      cmd_compact
+      ;;
+    wide)
+      cmd_wide
+      ;;
+    new)
+      cmd_new
+      ;;
+    kill-current)
+      cmd_kill_current
+      ;;
+    repair)
+      cmd_repair
+      ;;
+    focus)
+      [[ $# -ge 2 ]] || fail "focus requires an entry name"
+      cmd_focus "$2"
+      ;;
+    focus-keep-sidebar)
+      [[ $# -ge 2 ]] || fail "focus-keep-sidebar requires an entry name"
+      cmd_focus_keep_sidebar "$2"
+      ;;
+    next)
+      cmd_next_prev next
+      ;;
+    next-keep-sidebar)
+      cmd_next_prev_keep_sidebar next
+      ;;
+    prev)
+      cmd_next_prev prev
+      ;;
+    prev-keep-sidebar)
+      cmd_next_prev_keep_sidebar prev
+      ;;
+    toggle-last)
+      cmd_toggle_last
+      ;;
+    focus-sidebar)
+      cmd_focus_sidebar
+      ;;
+    focus-right)
+      cmd_focus_right
+      ;;
+    register)
+      [[ $# -ge 3 ]] || fail "register requires <pane-id> <label>"
+      cmd_register "$2" "$3"
+      ;;
+    mark-agent)
+      [[ $# -ge 2 ]] || fail "mark-agent requires <pane-id> [provider] [label]"
+      cmd_mark_agent "$2" "${3:-}" "${4:-}"
+      ;;
+    mark-pane)
+      [[ $# -ge 2 ]] || fail "mark-pane requires <pane-id> [label]"
+      cmd_mark_pane "$2" "${3:-}"
+      ;;
+    set-status)
+      [[ $# -ge 3 ]] || fail "set-status requires <pane-id> <status> [text]"
+      cmd_set_status "$2" "$3" "${4:-}"
+      ;;
+    clear-status)
+      [[ $# -ge 2 ]] || fail "clear-status requires <pane-id>"
+      cmd_clear_status "$2"
+      ;;
+    list-entries)
+      cmd_list_entries
+      ;;
+    list-agents)
+      cmd_list_agents
+      ;;
+    snapshot)
+      cmd_snapshot
+      ;;
+    cleanup-dead)
+      cmd_cleanup_dead
+      ;;
+    refresh)
+      cmd_refresh
+      ;;
+    status)
+      cmd_status
+      ;;
+    ''|help|-h|--help)
+      usage
+      ;;
+    *)
+      fail "unknown command '$cmd'"
+      ;;
+  esac
+}
+
+main "$@"
