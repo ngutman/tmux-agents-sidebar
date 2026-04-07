@@ -9,7 +9,13 @@ It gives you:
 - pane labels derived from cwd / git branch context
 - optional Pi integration for pane-border activity indicators and sidebar row status
 
-![tmux agents sidebar screenshot](assets/agents-sidebar.png)
+<p align="center">
+  <video src="assets/demo.mov" controls muted playsinline width="100%">
+    <a href="assets/demo.mov">Watch the demo video</a>
+  </video>
+</p>
+
+[Watch the demo video](assets/demo.mov)
 
 ## Features
 
