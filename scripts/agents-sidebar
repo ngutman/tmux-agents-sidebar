@@ -240,14 +240,26 @@ is_internal_pane_title() {
 
 pane_exists() {
   local pane_id="$1"
+  local existing_pane
   [[ -n "$pane_id" ]] || return 1
-  tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1
+
+  while IFS= read -r existing_pane; do
+    [[ "$existing_pane" == "$pane_id" ]] && return 0
+  done < <(tmux list-panes -a -F '#{pane_id}' 2>/dev/null || true)
+
+  return 1
 }
 
 window_exists() {
   local window_id="$1"
+  local existing_window
   [[ -n "$window_id" ]] || return 1
-  tmux display-message -p -t "$window_id" '#{window_id}' >/dev/null 2>&1
+
+  while IFS= read -r existing_window; do
+    [[ "$existing_window" == "$window_id" ]] && return 0
+  done < <(tmux list-windows -a -F '#{window_id}' 2>/dev/null || true)
+
+  return 1
 }
 
 pane_is_dead() {
