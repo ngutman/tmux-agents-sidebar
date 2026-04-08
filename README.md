@@ -12,11 +12,11 @@ It gives you:
 - pane labels derived from cwd / git branch context
 - optional Pi integration for pane-border activity indicators and sidebar row status
 
-![tmux agents sidebar screenshot](assets/agents-sidebar.png)
 
-<p align="center">
-  <video src="assets/demo.mp4" controls muted width="900"></video>
-</p>
+
+https://github.com/user-attachments/assets/777840ba-1777-4f0b-8921-3829c5187527
+
+
 
 <p align="center"><em><code>prefix M</code> switches to wide mode, <code>prefix m</code> switches back to compact mode.</em></p>
 
