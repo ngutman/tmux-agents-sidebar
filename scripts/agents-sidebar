@@ -62,15 +62,26 @@ tmux_available() {
 current_client_field() {
   local field="$1"
   local tty="${AGENTS_SIDEBAR_CLIENT_TTY:-}"
+  local client_tty session_id window_id pane_id result=""
   [[ -n "$tty" ]] || return 1
-  tmux list-clients -F "#{client_tty}${DELIM}#{session_id}${DELIM}#{window_id}${DELIM}#{pane_id}" 2>/dev/null | awk -F "$DELIM" -v target="$tty" -v wanted="$field" '
-    $1 == target {
-      if (wanted == "session_id") print $2;
-      else if (wanted == "window_id") print $3;
-      else if (wanted == "pane_id") print $4;
-      exit
-    }
-  '
+
+  while IFS="$DELIM" read -r client_tty session_id window_id pane_id; do
+    [[ "$client_tty" == "$tty" ]] || continue
+    case "$field" in
+      session_id)
+        result="$session_id"
+        ;;
+      window_id)
+        result="$window_id"
+        ;;
+      pane_id)
+        result="$pane_id"
+        ;;
+    esac
+  done < <(tmux list-clients -F "#{client_tty}${DELIM}#{session_id}${DELIM}#{window_id}${DELIM}#{pane_id}" 2>/dev/null || true)
+
+  [[ -n "$result" ]] || return 1
+  echo "$result"
 }
 
 current_session_id() {
@@ -229,12 +240,14 @@ is_internal_pane_title() {
 
 pane_exists() {
   local pane_id="$1"
-  tmux list-panes -a -F '#{pane_id}' | grep -Fxq "$pane_id"
+  [[ -n "$pane_id" ]] || return 1
+  tmux display-message -p -t "$pane_id" '#{pane_id}' >/dev/null 2>&1
 }
 
 window_exists() {
   local window_id="$1"
-  tmux list-windows -a -F '#{window_id}' | grep -Fxq "$window_id"
+  [[ -n "$window_id" ]] || return 1
+  tmux display-message -p -t "$window_id" '#{window_id}' >/dev/null 2>&1
 }
 
 pane_is_dead() {
@@ -324,7 +337,11 @@ current_client_tty() {
   fi
 
   if [[ "$(session_client_count)" == "1" ]]; then
-    tmux list-clients -t "$SESSION_ID" -F '#{client_tty}' 2>/dev/null | head -n1
+    local first_tty=""
+    while IFS= read -r tty; do
+      [[ -n "$first_tty" ]] || first_tty="$tty"
+    done < <(tmux list-clients -t "$SESSION_ID" -F '#{client_tty}' 2>/dev/null || true)
+    echo "$first_tty"
   fi
 }
 
@@ -332,7 +349,10 @@ current_client_width() {
   local tty width
   tty="$(current_client_tty)"
   if [[ -n "$tty" ]]; then
-    width="$(tmux list-clients -t "$SESSION_ID" -F "#{client_tty}${DELIM}#{client_width}" 2>/dev/null | awk -F "$DELIM" -v target="$tty" '$1 == target { print $2; exit }')"
+    local client_tty
+    while IFS="$DELIM" read -r client_tty width; do
+      [[ "$client_tty" == "$tty" ]] || continue
+    done < <(tmux list-clients -t "$SESSION_ID" -F "#{client_tty}${DELIM}#{client_width}" 2>/dev/null || true)
     if [[ "$width" =~ ^[0-9]+$ ]]; then
       echo "$width"
       return 0
@@ -340,7 +360,11 @@ current_client_width() {
   fi
 
   if [[ "$(session_client_count)" == "1" ]]; then
-    tmux list-clients -t "$SESSION_ID" -F '#{client_width}' 2>/dev/null | head -n1
+    local first_width=""
+    while IFS= read -r width; do
+      [[ -n "$first_width" ]] || first_width="$width"
+    done < <(tmux list-clients -t "$SESSION_ID" -F '#{client_width}' 2>/dev/null || true)
+    echo "$first_width"
   fi
 }
 
@@ -351,7 +375,16 @@ managed_pane_ids_in_window() {
 
 window_has_internal_sidebar_panes() {
   local window_id="$1"
-  tmux list-panes -t "$window_id" -F '#{pane_title}' 2>/dev/null | grep -Eq '^__agents_sidebar_'
+  local title found=1
+
+  found=1
+  while IFS= read -r title; do
+    if [[ "$title" == __agents_sidebar_* ]]; then
+      found=0
+    fi
+  done < <(tmux list-panes -t "$window_id" -F '#{pane_title}' 2>/dev/null || true)
+
+  return "$found"
 }
 
 saved_wide_layout_exists() {
@@ -503,12 +536,15 @@ ensure_store_window() {
 }
 
 store_target_pane() {
-  local store_window target_pane
+  local store_window target_pane pane_id
   store_window="$(store_window_id)"
   if [[ -z "$store_window" ]] || ! window_exists "$store_window"; then
     store_window="$(ensure_store_window)"
   fi
-  target_pane="$(tmux list-panes -t "$store_window" -F '#{pane_id}' | head -n1)"
+  target_pane=""
+  while IFS= read -r pane_id; do
+    [[ -n "$target_pane" ]] || target_pane="$pane_id"
+  done < <(tmux list-panes -t "$store_window" -F '#{pane_id}' 2>/dev/null || true)
   [[ -n "$target_pane" ]] || fail "store window has no target pane"
   echo "$target_pane"
 }
@@ -1318,6 +1354,21 @@ ordered_entry_names() {
   ordered_entry_lines | cut -d "$DELIM" -f1
 }
 
+entry_name_by_pane() {
+  local target_pane="$1"
+  local line label pane_id _rest found=""
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label pane_id _rest <<<"$line"
+    if [[ "$pane_id" == "$target_pane" ]]; then
+      found="$label"
+    fi
+  done < <(discover_entries)
+
+  echo "$found"
+}
+
 entry_pane_by_name() {
   local target="$1"
   local matches=()
@@ -1342,15 +1393,35 @@ entry_pane_by_name() {
 }
 
 first_entry_name() {
-  ordered_entry_names | head -n1
+  local name first_name=""
+
+  while IFS= read -r name; do
+    [[ -n "$first_name" ]] || first_name="$name"
+  done < <(ordered_entry_names)
+
+  echo "$first_name"
+}
+
+first_other_entry_name() {
+  local current_name="$1"
+  local name match=""
+
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ -z "$match" && "$name" != "$current_name" ]]; then
+      match="$name"
+    fi
+  done < <(ordered_entry_names)
+
+  echo "$match"
 }
 
 current_entry_name() {
-  local pane_id line
+  local pane_id name
   pane_id="$(current_pane_id)"
-  line="$(discover_entries | awk -F "$DELIM" -v pane="$pane_id" '$2 == pane { print; exit }')"
-  if [[ -n "$line" ]]; then
-    echo "${line%%$DELIM*}"
+  name="$(entry_name_by_pane "$pane_id")"
+  if [[ -n "$name" ]]; then
+    echo "$name"
   fi
 }
 
@@ -1542,24 +1613,70 @@ cleanup_duplicate_sidebar_panes() {
   done < <(tmux list-panes -t "$target_window" -F '#{pane_id}	#{pane_title}')
 }
 
+active_non_sidebar_pane_in_window() {
+  local target_window="$1"
+  local sidebar_pane="${2:-}"
+  local pane_id pane_active match=""
+
+  while IFS=$'\t' read -r pane_id pane_active; do
+    [[ -n "$pane_id" ]] || continue
+    if [[ -z "$match" && "$pane_id" != "$sidebar_pane" && "$pane_active" == "1" ]]; then
+      match="$pane_id"
+    fi
+  done < <(tmux list-panes -t "$target_window" -F '#{pane_id}	#{pane_active}' 2>/dev/null || true)
+
+  echo "$match"
+}
+
+first_non_sidebar_pane_in_window() {
+  local target_window="$1"
+  local sidebar_pane="${2:-}"
+  local pane_id match=""
+
+  while IFS= read -r pane_id; do
+    [[ -n "$pane_id" ]] || continue
+    if [[ -z "$match" && "$pane_id" != "$sidebar_pane" ]]; then
+      match="$pane_id"
+    fi
+  done < <(tmux list-panes -t "$target_window" -F '#{pane_id}' 2>/dev/null || true)
+
+  echo "$match"
+}
+
 ensure_sidebar() {
-  local compact_window focus_pane sidebar_pane width
+  local compact_window focus_pane sidebar_pane width candidate_pane
   compact_window="$(get_option @agents_sidebar_compact_window)"
   focus_pane="$(get_option @agents_sidebar_focus_pane)"
   sidebar_pane="$(get_option @agents_sidebar_pane)"
 
   [[ -n "$compact_window" ]] || fail "compact window is missing"
   window_exists "$compact_window" || fail "compact window no longer exists"
-  [[ -n "$focus_pane" ]] || fail "focus pane is missing"
-  pane_exists "$focus_pane" || fail "focus pane no longer exists"
+
+  if [[ -n "$focus_pane" ]] && pane_exists "$focus_pane" && [[ "$(pane_window_id "$focus_pane")" == "$compact_window" ]] && [[ "$focus_pane" != "$sidebar_pane" ]]; then
+    :
+  else
+    candidate_pane="$(active_non_sidebar_pane_in_window "$compact_window" "$sidebar_pane")"
+    if [[ -z "$candidate_pane" ]]; then
+      candidate_pane="$(first_non_sidebar_pane_in_window "$compact_window" "$sidebar_pane")"
+    fi
+    [[ -n "$candidate_pane" ]] || fail "focus pane is missing"
+    focus_pane="$candidate_pane"
+    set_option @agents_sidebar_focus_pane "$focus_pane"
+  fi
 
   if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
-    cleanup_duplicate_sidebar_panes "$sidebar_pane" "$compact_window"
-    enforce_sidebar_width "$sidebar_pane" "$compact_window"
-    if pane_is_dead "$sidebar_pane"; then
-      start_sidebar "$sidebar_pane" "$compact_window"
+    if [[ "$(pane_window_id "$sidebar_pane")" != "$compact_window" ]]; then
+      tmux kill-pane -t "$sidebar_pane" 2>/dev/null || true
+      unset_option @agents_sidebar_pane
+      sidebar_pane=""
+    else
+      cleanup_duplicate_sidebar_panes "$sidebar_pane" "$compact_window"
+      enforce_sidebar_width "$sidebar_pane" "$compact_window"
+      if pane_is_dead "$sidebar_pane"; then
+        start_sidebar "$sidebar_pane" "$compact_window"
+      fi
+      return 0
     fi
-    return 0
   fi
 
   width="$(sidebar_width "$compact_window")"
@@ -1643,7 +1760,7 @@ _cmd_compact_impl() {
     compact_window="$(pane_window_id "$active_pane")"
   else
     compact_window="$(tmux new-window -d -P -F '#{window_id}' -t "$SESSION_ID" -n "$wide_name")"
-    host_placeholder="$(tmux list-panes -t "$compact_window" -F '#{pane_id}' | head -n1)"
+    host_placeholder="$(first_non_sidebar_pane_in_window "$compact_window")"
     tmux select-pane -t "$host_placeholder" -T '__agents_sidebar_focus_placeholder' >/dev/null 2>&1 || true
     tmux join-pane -d -s "$active_pane" -t "$host_placeholder"
     tmux kill-pane -t "$host_placeholder"
@@ -1916,18 +2033,45 @@ cmd_focus_right() {
 }
 
 refresh_active_state() {
-  local mode active_name active_pane current_name
+  local mode active_name active_pane current_name compact_window sidebar_pane candidate_pane
   mode="$(get_option @agents_sidebar_mode)"
   [[ "$mode" == 'compact' ]] || return 0
 
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
   active_pane="$(get_option @agents_sidebar_focus_pane)"
+
   if [[ -n "$active_pane" ]] && pane_exists "$active_pane"; then
-    current_name="$(discover_entries | awk -F "$DELIM" -v pane="$active_pane" '$2 == pane { print $1; exit }')"
-    if [[ -n "$current_name" && "$current_name" != "$(get_option @agents_sidebar_active_name)" ]]; then
-      set_option @agents_sidebar_active_name "$current_name"
-      bump_epoch
+    if [[ -n "$compact_window" ]] && window_exists "$compact_window" && [[ "$(pane_window_id "$active_pane")" == "$compact_window" ]] && [[ "$active_pane" != "$sidebar_pane" ]]; then
+      current_name="$(entry_name_by_pane "$active_pane")"
+      if [[ -n "$current_name" ]]; then
+        if [[ "$current_name" != "$(get_option @agents_sidebar_active_name)" ]]; then
+          set_option @agents_sidebar_active_name "$current_name"
+          bump_epoch
+        fi
+        return 0
+      fi
     fi
-    return 0
+  fi
+
+  candidate_pane=""
+  if [[ -n "$compact_window" ]] && window_exists "$compact_window"; then
+    candidate_pane="$(active_non_sidebar_pane_in_window "$compact_window" "$sidebar_pane")"
+    if [[ -z "$candidate_pane" ]]; then
+      candidate_pane="$(first_non_sidebar_pane_in_window "$compact_window" "$sidebar_pane")"
+    fi
+  fi
+
+  if [[ -n "$candidate_pane" ]]; then
+    current_name="$(entry_name_by_pane "$candidate_pane")"
+    if [[ -n "$current_name" ]]; then
+      set_option @agents_sidebar_focus_pane "$candidate_pane"
+      if [[ "$current_name" != "$(get_option @agents_sidebar_active_name)" ]]; then
+        set_option @agents_sidebar_active_name "$current_name"
+      fi
+      bump_epoch
+      return 0
+    fi
   fi
 
   active_name="$(get_option @agents_sidebar_active_name)"
@@ -1964,7 +2108,8 @@ _cmd_repair_impl() {
   compact_window="$(get_option @agents_sidebar_compact_window)"
   focus_pane="$(get_option @agents_sidebar_focus_pane)"
 
-  if [[ -n "$compact_window" ]] && window_exists "$compact_window" && [[ -n "$focus_pane" ]] && pane_exists "$focus_pane"; then
+  if [[ -n "$compact_window" ]] && window_exists "$compact_window"; then
+    refresh_active_state >/dev/null 2>&1 || true
     ensure_sidebar
     refresh_active_state >/dev/null 2>&1 || true
     return 0
@@ -2007,8 +2152,8 @@ cmd_kill_current() {
     fi
 
     if [[ -n "$focus_pane" && "$target_pane" == "$focus_pane" ]]; then
-      label="$(discover_entries | awk -F "$DELIM" -v pane="$target_pane" '$2 == pane { print $1; exit }')"
-      next_name="$(ordered_entry_names | grep -Fxv "$label" | head -n1 || true)"
+      label="$(entry_name_by_pane "$target_pane")"
+      next_name="$(first_other_entry_name "$label")"
       if [[ -n "$next_name" ]]; then
         cmd_focus "$next_name"
       else
@@ -2055,7 +2200,7 @@ cmd_new() {
     new_pane="$(tmux split-window -d -h -t "$target_for_split" -c "$source_path" -P -F '#{pane_id}')"
     remember_entry_kind "$new_pane" pane
     tmux swap-pane -d -s "$new_pane" -t "$focus_pane"
-    new_name="$(discover_entries | awk -F "$DELIM" -v pane="$new_pane" '$2 == pane { print $1; exit }')"
+    new_name="$(entry_name_by_pane "$new_pane")"
     [[ -n "$new_name" ]] || fail "failed to discover new pane"
     set_option @agents_sidebar_last_active_name "$active_name"
     set_option @agents_sidebar_active_name "$new_name"
