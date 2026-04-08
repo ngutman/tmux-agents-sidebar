@@ -14,6 +14,12 @@ It gives you:
 
 ![tmux agents sidebar screenshot](assets/agents-sidebar.png)
 
+<p align="center">
+  <video src="assets/demo.mp4" controls muted width="900"></video>
+</p>
+
+<p align="center"><em><code>prefix M</code> switches to wide mode, <code>prefix m</code> switches back to compact mode.</em></p>
+
 ## Features
 
 - `wide` mode with saved custom layout restoration across compact/wide switching
