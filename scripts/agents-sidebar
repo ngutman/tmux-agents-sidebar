@@ -1501,6 +1501,22 @@ create_sidebar_pane() {
   echo "$sidebar_pane"
 }
 
+enforce_sidebar_width() {
+  local sidebar_pane="$1"
+  local compact_window="$2"
+  local desired_width current_width
+
+  [[ -n "$sidebar_pane" ]] || return 0
+  pane_exists "$sidebar_pane" || return 0
+  desired_width="$(sidebar_width "$compact_window")"
+  current_width="$(tmux display-message -p -t "$sidebar_pane" '#{pane_width}' 2>/dev/null || true)"
+  [[ "$desired_width" =~ ^[0-9]+$ ]] || return 0
+  [[ "$current_width" =~ ^[0-9]+$ ]] || current_width=0
+  if (( current_width != desired_width )); then
+    tmux resize-pane -t "$sidebar_pane" -x "$desired_width" >/dev/null 2>&1 || true
+  fi
+}
+
 start_sidebar() {
   local sidebar_pane="$1"
   local compact_window="$2"
@@ -1539,6 +1555,7 @@ ensure_sidebar() {
 
   if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
     cleanup_duplicate_sidebar_panes "$sidebar_pane" "$compact_window"
+    enforce_sidebar_width "$sidebar_pane" "$compact_window"
     if pane_is_dead "$sidebar_pane"; then
       start_sidebar "$sidebar_pane" "$compact_window"
     fi
@@ -2178,6 +2195,17 @@ cmd_refresh() {
   refresh_active_state
 }
 
+cmd_maintain_sidebar_width() {
+  local mode compact_window sidebar_pane
+
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" == 'compact' ]] || return 0
+  compact_window="$(get_option @agents_sidebar_compact_window)"
+  sidebar_pane="$(get_option @agents_sidebar_pane)"
+  [[ -n "$compact_window" && -n "$sidebar_pane" ]] || return 0
+  enforce_sidebar_width "$sidebar_pane" "$compact_window"
+}
+
 cmd_save_wide_layout() {
   cleanup_dead_panes
   save_wide_layout
@@ -2316,6 +2344,7 @@ commands:
   save-wide-layout              save the current wide layout snapshot
   maybe-auto-compact            debounce and queue compact mode if the attached client is narrow enough
   run-auto-compact <token>      execute a queued auto-compact transition if still valid
+  maintain-sidebar-width        reapply the configured compact sidebar width
   status                        print current state and discovered entries
 EOF
 }
@@ -2413,6 +2442,9 @@ main() {
     run-auto-compact)
       [[ $# -ge 2 ]] || fail "run-auto-compact requires <token>"
       cmd_run_auto_compact "$2"
+      ;;
+    maintain-sidebar-width)
+      cmd_maintain_sidebar_width
       ;;
     status)
       cmd_status
