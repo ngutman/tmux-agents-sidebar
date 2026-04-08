@@ -34,6 +34,7 @@ When working in this repository, start with:
 - Keep the public docs in sync with the actual command surface and installation flow.
 - Preserve both manual installation and TPM-style loading.
 - Keep compact and wide mode behavior compatible and repairable.
+- Preserve saved wide layouts when switching to compact, and fall back safely if compact mode changes pane membership.
 - Avoid slow per-refresh logic in the sidebar; responsiveness matters.
 - Labels are derived live from pane state; manual pane naming is currently disabled.
 - Branch labels are derived per pane from that pane's working directory.

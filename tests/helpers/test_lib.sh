@@ -13,6 +13,11 @@ TEST_PRIMARY_PANE=""
 TEST_PATH_DIR=""
 TEST_TMPDIR=""
 TEST_HOME=""
+TEST_CLIENT_HELPER_PIDS=()
+TEST_CLIENT_CMD_FILES=()
+LAST_TEST_CLIENT_HELPER_PID=""
+LAST_TEST_CLIENT_TTY=""
+LAST_TEST_CLIENT_CMD_FILE=""
 
 fail() {
   echo "FAIL: $*" >&2
@@ -79,9 +84,121 @@ EOF
   export HOME="$TEST_HOME"
   export AGENTS_SIDEBAR_SESSION="$TEST_SESSION_ID"
   export AGENTS_SIDEBAR_PANE="$TEST_PRIMARY_PANE"
+  tmux_test set-environment -g PATH "$PATH"
+  tmux_test set-environment -g HOME "$HOME"
+}
+
+stop_test_client() {
+  local helper_pid="$1"
+  if [[ -n "$helper_pid" ]]; then
+    kill "$helper_pid" >/dev/null 2>&1 || true
+    wait "$helper_pid" >/dev/null 2>&1 || true
+  fi
+}
+
+start_test_client() {
+  local width="${1:-200}"
+  local height="${2:-40}"
+  local session_name="${3:-$TEST_SESSION_NAME}"
+  local client_id info_file cmd_file helper_pid client_tty helper_script
+
+  client_id="client-${RANDOM}-$$-${#TEST_CLIENT_HELPER_PIDS[@]}"
+  info_file="$TEST_TMPDIR/${client_id}.info"
+  cmd_file="$TEST_TMPDIR/${client_id}.cmd"
+  helper_script="$TEST_TMPDIR/${client_id}.py"
+
+  cat > "$helper_script" <<'PY'
+import fcntl
+import os
+import pty
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+
+real_tmux, socket_name, session_name, width, height, info_file, cmd_file = sys.argv[1:8]
+width = int(width)
+height = int(height)
+master_fd, slave_fd = pty.openpty()
+fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack('HHHH', height, width, 0, 0))
+client_tty = os.ttyname(slave_fd)
+proc = subprocess.Popen(
+    [real_tmux, '-L', socket_name, 'attach-session', '-t', session_name],
+    stdin=slave_fd,
+    stdout=slave_fd,
+    stderr=slave_fd,
+    close_fds=True,
+)
+os.close(slave_fd)
+with open(info_file, 'w', encoding='utf-8') as handle:
+    handle.write(client_tty)
+flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
+fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+try:
+    while proc.poll() is None:
+        if os.path.exists(cmd_file):
+            with open(cmd_file, 'r', encoding='utf-8') as handle:
+                command = handle.read().strip().split()
+            os.unlink(cmd_file)
+            if len(command) == 3 and command[0] == 'resize':
+                new_width = int(command[1])
+                new_height = int(command[2])
+                fcntl.ioctl(master_fd, termios.TIOCSWINSZ, struct.pack('HHHH', new_height, new_width, 0, 0))
+                try:
+                    os.kill(proc.pid, signal.SIGWINCH)
+                except OSError:
+                    pass
+        try:
+            os.read(master_fd, 65536)
+        except BlockingIOError:
+            pass
+        except OSError:
+            break
+        time.sleep(0.05)
+finally:
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+PY
+
+  python3 "$helper_script" "$REAL_TMUX" "$TEST_SOCKET" "$session_name" "$width" "$height" "$info_file" "$cmd_file" >/dev/null 2>&1 &
+  helper_pid=$!
+  wait_until "[ -s '$info_file' ]" 5
+  client_tty="$(read_file_line "$info_file")"
+  wait_until "tmux_test list-clients -t '$TEST_SESSION_ID' -F '#{client_tty}' | grep -Fxq '$client_tty'" 5
+  TEST_CLIENT_HELPER_PIDS+=("$helper_pid")
+  TEST_CLIENT_CMD_FILES+=("$cmd_file")
+  LAST_TEST_CLIENT_HELPER_PID="$helper_pid"
+  LAST_TEST_CLIENT_TTY="$client_tty"
+  LAST_TEST_CLIENT_CMD_FILE="$cmd_file"
+}
+
+resize_test_client() {
+  local cmd_file="$1"
+  local width="$2"
+  local height="${3:-40}"
+  printf 'resize %s %s\n' "$width" "$height" > "$cmd_file"
+}
+
+read_file_line() {
+  local path="$1"
+  local line=""
+  IFS= read -r line < "$path" || true
+  printf '%s\n' "$line"
 }
 
 cleanup_test_server() {
+  local helper_pid
+  for helper_pid in "${TEST_CLIENT_HELPER_PIDS[@]:-}"; do
+    stop_test_client "$helper_pid"
+  done
   if [[ -n "$TEST_SOCKET" ]]; then
     "$REAL_TMUX" -L "$TEST_SOCKET" kill-server >/dev/null 2>&1 || true
   fi

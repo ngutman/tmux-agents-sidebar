@@ -2,6 +2,9 @@
 
 A tmux plugin for compact multi-agent workflows.
 
+> **Note**
+> This project was 100% vibe coded. The internals may be a little messy, but it does what it needs to do.
+
 It gives you:
 - a compact sidebar UI with separate `Agents` and `Panes` sections
 - fast switching between managed panes
@@ -13,8 +16,9 @@ It gives you:
 
 ## Features
 
-- `wide` mode for even-horizontal multi-pane layouts
+- `wide` mode with saved custom layout restoration across compact/wide switching
 - `compact` mode with one focused pane plus a persistent sidebar
+- optional automatic compact mode when the attached client becomes narrow enough
 - sidebar keyboard and mouse navigation
 - explicit pane classification (`mark-agent`, `mark-pane`)
 - status metadata (`idle`, `running`, `tool`, `done`, `error`, `unknown`)
@@ -121,6 +125,8 @@ Default key bindings:
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar snapshot
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar cleanup-dead
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar refresh
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar save-wide-layout
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar maybe-auto-compact
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar status
 ```
 
@@ -133,10 +139,16 @@ set -g @agents_sidebar_width 45
 set -g @agents_sidebar_order 'orch plan impl review docs'
 set -g @agents_sidebar_done_ttl 20
 set -g @agents_sidebar_wide_window_name_default 'agents-sidebar'
+set -g @agents_sidebar_auto_compact_on_narrow 1
+set -g @agents_sidebar_auto_compact_width 180
 ```
 
 Notes:
 - the default sidebar width is `45`
+- wide-mode pane topology is saved and restored when the managed pane set is unchanged
+- if pane membership changes while compact mode is active, wide restore falls back to `even-horizontal`
+- auto-compact is debounced slightly so it runs after resize activity settles, not during the resize storm
+- auto-compact only runs when exactly one tmux client is attached to the session
 - labels are derived live from pane title, cwd, git branch, and command/provider heuristics
 - labels are made unique automatically when multiple panes would otherwise collide
 - branch labels are derived from each pane's own working directory, not from a shared tmux variable

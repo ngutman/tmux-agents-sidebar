@@ -6,9 +6,12 @@ SIDEBAR_SCRIPT="$SCRIPT_DIR/agents-sidebar.py"
 
 DEFAULT_AGENT_ORDER="orch plan impl review docs"
 DEFAULT_SIDEBAR_WIDTH="45"
+MIN_SIDEBAR_WIDTH="20"
+MIN_MAIN_PANE_WIDTH="35"
 DEFAULT_WIDE_WINDOW_NAME="agents-sidebar"
 DEFAULT_DONE_TTL="20"
 BRANCH_CACHE_TTL="2"
+AUTO_COMPACT_DEBOUNCE_SECONDS="0.4"
 DELIM=$'\x1f'
 HOST_FULL="$(hostname 2>/dev/null || true)"
 HOST_SHORT="$(hostname -s 2>/dev/null || true)"
@@ -25,8 +28,21 @@ declare -Ag ENTRY_BRANCH_PATH_CACHE=()
 declare -Ag ENTRY_BRANCH_CHECKED_CACHE=()
 SESSION_METADATA_CACHE_LOADED=0
 
+clear_pending_auto_compact() {
+  [[ -n "${SESSION_ID:-}" ]] || return 0
+  unset_option @agents_sidebar_pending_auto_compact
+  unset_option @agents_sidebar_pending_auto_compact_token
+  unset_option @agents_sidebar_pending_auto_compact_client
+}
+
 fail() {
   local message="agents-sidebar: $*"
+  if [[ -n "${SESSION_ID:-}" ]] && command -v tmux >/dev/null 2>&1; then
+    unset_option @agents_sidebar_transition
+    clear_pending_auto_compact
+    release_mode_transition_lock
+    release_repair_lock
+  fi
   echo "$message" >&2
   if [[ "${AGENTS_SIDEBAR_NOTIFY:-0}" == "1" ]] && command -v tmux >/dev/null 2>&1; then
     local target="${AGENTS_SIDEBAR_PANE:-${TMUX_PANE:-}}"
@@ -43,12 +59,32 @@ tmux_available() {
   command -v tmux >/dev/null 2>&1
 }
 
+current_client_field() {
+  local field="$1"
+  local tty="${AGENTS_SIDEBAR_CLIENT_TTY:-}"
+  [[ -n "$tty" ]] || return 1
+  tmux list-clients -F "#{client_tty}${DELIM}#{session_id}${DELIM}#{window_id}${DELIM}#{pane_id}" 2>/dev/null | awk -F "$DELIM" -v target="$tty" -v wanted="$field" '
+    $1 == target {
+      if (wanted == "session_id") print $2;
+      else if (wanted == "window_id") print $3;
+      else if (wanted == "pane_id") print $4;
+      exit
+    }
+  '
+}
+
 current_session_id() {
-  local target_pane="${AGENTS_SIDEBAR_PANE:-${TMUX_PANE:-}}"
+  local target_pane client_session
+  target_pane="${AGENTS_SIDEBAR_PANE:-${TMUX_PANE:-}}"
   if [[ -n "$target_pane" ]]; then
     tmux display-message -p -t "$target_pane" '#{session_id}'
   else
-    tmux display-message -p '#{session_id}'
+    client_session="$(current_client_field session_id)"
+    if [[ -n "$client_session" ]]; then
+      echo "$client_session"
+    else
+      tmux display-message -p '#{session_id}'
+    fi
   fi
 }
 
@@ -93,31 +129,54 @@ bump_epoch() {
 
 remember_sidebar_width() {
   local pane_id="${1:-$(get_option @agents_sidebar_pane)}"
-  local width
+  local width title
 
   if [[ -n "$pane_id" ]] && pane_exists "$pane_id"; then
+    title="$(tmux display-message -p -t "$pane_id" '#{pane_title}' 2>/dev/null || true)"
+    [[ "$title" == "__agents_sidebar_nav" ]] || return 0
     width="$(tmux display-message -p -t "$pane_id" '#{pane_width}' 2>/dev/null || true)"
-    if [[ "$width" =~ ^[0-9]+$ && "$width" -gt 0 ]]; then
+    if [[ "$width" =~ ^[0-9]+$ && "$width" -ge "$MIN_SIDEBAR_WIDTH" ]]; then
       set_option @agents_sidebar_width "$width"
     fi
   fi
 }
 
 sidebar_width() {
-  local value pane_id
+  local target="${1:-}"
+  local value pane_id window_width max_allowed fallback
+
   value="$(get_option @agents_sidebar_width)"
-  if [[ -n "$value" ]]; then
-    echo "$value"
-    return 0
+  pane_id="$(get_option @agents_sidebar_pane)"
+  if [[ -z "$value" && -n "$pane_id" ]] && pane_exists "$pane_id"; then
+    value="$(tmux display-message -p -t "$pane_id" '#{pane_width}' 2>/dev/null || true)"
   fi
 
-  pane_id="$(get_option @agents_sidebar_pane)"
-  if [[ -n "$pane_id" ]] && pane_exists "$pane_id"; then
-    value="$(tmux display-message -p -t "$pane_id" '#{pane_width}' 2>/dev/null || true)"
-    if [[ "$value" =~ ^[0-9]+$ && "$value" -gt 0 ]]; then
-      echo "$value"
+  if [[ -n "$target" ]]; then
+    window_width="$(tmux display-message -p -t "$target" '#{window_width}' 2>/dev/null || true)"
+    if [[ "$window_width" =~ ^[0-9]+$ && "$window_width" -gt 0 ]]; then
+      max_allowed=$((window_width - MIN_MAIN_PANE_WIDTH))
+      if (( max_allowed < MIN_SIDEBAR_WIDTH )); then
+        max_allowed=$MIN_SIDEBAR_WIDTH
+      fi
+      fallback="$DEFAULT_SIDEBAR_WIDTH"
+      if (( fallback > max_allowed )); then
+        fallback="$max_allowed"
+      fi
+
+      if [[ "$value" =~ ^[0-9]+$ ]] && (( value >= MIN_SIDEBAR_WIDTH && value <= max_allowed )); then
+        echo "$value"
+        return 0
+      fi
+
+      set_option @agents_sidebar_width "$fallback"
+      echo "$fallback"
       return 0
     fi
+  fi
+
+  if [[ "$value" =~ ^[0-9]+$ && "$value" -ge "$MIN_SIDEBAR_WIDTH" ]]; then
+    echo "$value"
+    return 0
   fi
 
   echo "$DEFAULT_SIDEBAR_WIDTH"
@@ -139,6 +198,23 @@ done_status_ttl() {
   local value
   value="$(get_option @agents_sidebar_done_ttl)"
   echo "${value:-$DEFAULT_DONE_TTL}"
+}
+
+auto_compact_on_narrow() {
+  local value
+  value="$(get_option @agents_sidebar_auto_compact_on_narrow)"
+  echo "${value:-1}"
+}
+
+auto_compact_width() {
+  local value
+  value="$(get_option @agents_sidebar_auto_compact_width)"
+  echo "${value:-180}"
+}
+
+option_is_enabled() {
+  local value="${1,,}"
+  [[ "$value" == "1" || "$value" == "on" || "$value" == "yes" || "$value" == "true" ]]
 }
 
 is_internal_window_name() {
@@ -167,17 +243,37 @@ pane_is_dead() {
 }
 
 current_pane_id() {
+  local client_pane
   if [[ -n "${AGENTS_SIDEBAR_PANE:-}" ]]; then
     echo "$AGENTS_SIDEBAR_PANE"
   elif [[ -n "${TMUX_PANE:-}" ]]; then
     echo "$TMUX_PANE"
   else
-    tmux display-message -p '#{pane_id}'
+    client_pane="$(current_client_field pane_id)"
+    if [[ -n "$client_pane" ]]; then
+      echo "$client_pane"
+    else
+      tmux display-message -p '#{pane_id}'
+    fi
+  fi
+}
+
+current_window_id() {
+  local client_window
+  if [[ -n "${AGENTS_SIDEBAR_WINDOW:-}" ]]; then
+    echo "$AGENTS_SIDEBAR_WINDOW"
+  else
+    client_window="$(current_client_field window_id)"
+    if [[ -n "$client_window" ]]; then
+      echo "$client_window"
+    else
+      tmux display-message -p -t "$(current_pane_id)" '#{window_id}'
+    fi
   fi
 }
 
 current_window_name() {
-  tmux display-message -p -t "$(current_pane_id)" '#{window_name}'
+  tmux display-message -p -t "$(current_window_id)" '#{window_name}'
 }
 
 pane_session_id() {
@@ -188,10 +284,165 @@ pane_window_id() {
   tmux display-message -p -t "$1" '#{window_id}'
 }
 
+pane_option() {
+  local pane_id="$1"
+  local option_name="$2"
+  tmux show-option -pqv -t "$pane_id" "$option_name" 2>/dev/null || true
+}
+
+window_layout_string() {
+  tmux display-message -p -t "$1" '#{window_layout}'
+}
+
+window_active_pane_id() {
+  tmux display-message -p -t "$1" '#{pane_id}'
+}
+
 session_exists() {
   local session_id="$1"
   [[ -n "$session_id" ]] || return 1
   tmux has-session -t "$session_id" 2>/dev/null
+}
+
+session_client_count() {
+  local count
+  count="$(tmux list-clients -t "$SESSION_ID" -F '#{client_tty}' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  echo "${count:-0}"
+}
+
+current_client_tty() {
+  local tty="${AGENTS_SIDEBAR_CLIENT_TTY:-}"
+  if [[ -n "$tty" ]]; then
+    echo "$tty"
+    return 0
+  fi
+
+  tty="$(get_option @agents_sidebar_auto_mode_client)"
+  if [[ -n "$tty" ]]; then
+    echo "$tty"
+    return 0
+  fi
+
+  if [[ "$(session_client_count)" == "1" ]]; then
+    tmux list-clients -t "$SESSION_ID" -F '#{client_tty}' 2>/dev/null | head -n1
+  fi
+}
+
+current_client_width() {
+  local tty width
+  tty="$(current_client_tty)"
+  if [[ -n "$tty" ]]; then
+    width="$(tmux list-clients -t "$SESSION_ID" -F "#{client_tty}${DELIM}#{client_width}" 2>/dev/null | awk -F "$DELIM" -v target="$tty" '$1 == target { print $2; exit }')"
+    if [[ "$width" =~ ^[0-9]+$ ]]; then
+      echo "$width"
+      return 0
+    fi
+  fi
+
+  if [[ "$(session_client_count)" == "1" ]]; then
+    tmux list-clients -t "$SESSION_ID" -F '#{client_width}' 2>/dev/null | head -n1
+  fi
+}
+
+managed_pane_ids_in_window() {
+  local window_id="$1"
+  tmux list-panes -t "$window_id" -F "#{pane_id}${DELIM}#{pane_title}" 2>/dev/null | awk -F "$DELIM" '$2 !~ /^__agents_sidebar_/ { print $1 }' | paste -sd ' ' -
+}
+
+window_has_internal_sidebar_panes() {
+  local window_id="$1"
+  tmux list-panes -t "$window_id" -F '#{pane_title}' 2>/dev/null | grep -Eq '^__agents_sidebar_'
+}
+
+saved_wide_layout_exists() {
+  [[ -n "$(get_option @agents_sidebar_wide_layout)" ]]
+}
+
+mark_wide_layout_dirty() {
+  set_option @agents_sidebar_wide_layout_dirty 1
+}
+
+clear_wide_layout_dirty() {
+  set_option @agents_sidebar_wide_layout_dirty 0
+}
+
+saved_wide_layout_dirty() {
+  [[ "$(get_option @agents_sidebar_wide_layout_dirty)" == "1" ]]
+}
+
+save_wide_layout() {
+  local mode window_id window_name pane_ids layout active_pane
+  mode_transition_active && return 0
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" != 'compact' ]] || return 0
+
+  window_id="${1:-$(current_window_id)}"
+  [[ -n "$window_id" ]] || return 0
+  window_exists "$window_id" || return 0
+
+  window_name="$(tmux display-message -p -t "$window_id" '#{window_name}')"
+  is_internal_window_name "$window_name" && return 0
+
+  cleanup_duplicate_sidebar_panes "" "$window_id"
+  window_has_internal_sidebar_panes "$window_id" && return 0
+
+  pane_ids="$(managed_pane_ids_in_window "$window_id")"
+  [[ -n "$pane_ids" ]] || return 0
+
+  layout="$(window_layout_string "$window_id")"
+  [[ -n "$layout" ]] || return 0
+  active_pane="$(window_active_pane_id "$window_id")"
+
+  set_option @agents_sidebar_wide_layout "$layout"
+  set_option @agents_sidebar_wide_layout_panes "$pane_ids"
+  set_option @agents_sidebar_wide_layout_active_pane "$active_pane"
+  set_option @agents_sidebar_wide_layout_window "$window_id"
+  set_option @agents_sidebar_wide_layout_saved_at "$(date +%s)"
+  clear_wide_layout_dirty
+}
+
+saved_wide_layout_matches_current_panes() {
+  local window_id="$1"
+  local saved current
+  saved="$(get_option @agents_sidebar_wide_layout_panes | tr ' ' '\n' | sed '/^$/d' | sort | paste -sd ' ' -)"
+  current="$(managed_pane_ids_in_window "$window_id" | tr ' ' '\n' | sed '/^$/d' | sort | paste -sd ' ' -)"
+  [[ -n "$saved" && "$saved" == "$current" ]]
+}
+
+auto_compact_token() {
+  python3 - <<'PY'
+import time
+print(time.time_ns())
+PY
+}
+
+schedule_auto_compact_run() {
+  local token="$1"
+  local client_tty="$2"
+
+  nohup python3 - "$AUTO_COMPACT_DEBOUNCE_SECONDS" "$SESSION_ID" "$client_tty" "$SCRIPT_DIR/agents-sidebar" "$token" <<'PY' >/dev/null 2>&1 &
+import os
+import subprocess
+import sys
+import time
+
+delay, session_id, client_tty, script_path, token = sys.argv[1:6]
+time.sleep(float(delay))
+env = os.environ.copy()
+env["AGENTS_SIDEBAR_SESSION"] = session_id
+env["AGENTS_SIDEBAR_CLIENT_TTY"] = client_tty
+env.pop("AGENTS_SIDEBAR_PANE", None)
+env.pop("TMUX", None)
+subprocess.run(
+    [script_path, "run-auto-compact", token],
+    env=env,
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+    check=False,
+)
+PY
 }
 
 store_session_name() {
@@ -263,6 +514,8 @@ store_target_pane() {
 }
 
 REPAIR_LOCK_DIR=""
+MODE_TRANSITION_LOCK_DIR=""
+LAST_WIDE_TARGET_WINDOW=""
 
 repair_lock_dir() {
   local session_key
@@ -270,13 +523,46 @@ repair_lock_dir() {
   echo "/tmp/agents-sidebar-repair-${session_key}.lock"
 }
 
-with_repair_lock() {
+acquire_repair_lock() {
   REPAIR_LOCK_DIR="$(repair_lock_dir)"
-  if mkdir "$REPAIR_LOCK_DIR" 2>/dev/null; then
-    trap 'rmdir "$REPAIR_LOCK_DIR" 2>/dev/null || true' RETURN
-    return 0
+  mkdir "$REPAIR_LOCK_DIR" 2>/dev/null
+}
+
+release_repair_lock() {
+  if [[ -n "$REPAIR_LOCK_DIR" ]]; then
+    rmdir "$REPAIR_LOCK_DIR" 2>/dev/null || true
+    REPAIR_LOCK_DIR=""
   fi
-  return 1
+}
+
+mode_transition_lock_dir() {
+  local session_key
+  session_key="${SESSION_ID//[^[:alnum:]]/_}"
+  echo "/tmp/agents-sidebar-mode-${session_key}.lock"
+}
+
+acquire_mode_transition_lock() {
+  MODE_TRANSITION_LOCK_DIR="$(mode_transition_lock_dir)"
+  mkdir "$MODE_TRANSITION_LOCK_DIR" 2>/dev/null
+}
+
+release_mode_transition_lock() {
+  if [[ -n "$MODE_TRANSITION_LOCK_DIR" ]]; then
+    rmdir "$MODE_TRANSITION_LOCK_DIR" 2>/dev/null || true
+    MODE_TRANSITION_LOCK_DIR=""
+  fi
+}
+
+begin_mode_transition() {
+  set_option @agents_sidebar_transition 1
+}
+
+end_mode_transition() {
+  unset_option @agents_sidebar_transition
+}
+
+mode_transition_active() {
+  [[ "$(get_option @agents_sidebar_transition)" == "1" ]]
 }
 
 label_option_key() {
@@ -678,11 +964,20 @@ resolve_entry_provider() {
   local label="$3"
   local pane_title="$4"
   local pane_command="$5"
+  local pane_id="${6:-}"
   local provider
 
   if valid_entry_provider "$stored_provider"; then
     echo "$stored_provider"
     return
+  fi
+
+  if [[ -n "$pane_id" ]]; then
+    provider="$(pane_option "$pane_id" @pi_session_state)"
+    if [[ -n "$provider" ]]; then
+      echo "pi"
+      return
+    fi
   fi
 
   provider="$(detect_provider_from_text "$label $pane_title $pane_command")"
@@ -728,7 +1023,7 @@ resolve_entry_kind() {
   fi
 
   lowered="${label,,} ${pane_title,,} ${pane_command,,}"
-  if [[ "$lowered" == *"agent"* || "$lowered" == *"orchestrator"* ]]; then
+  if [[ "$lowered" =~ (^|[^[:alnum:]])agent([^[:alnum:]]|$) || "$lowered" =~ (^|[^[:alnum:]])orchestrator([^[:alnum:]]|$) ]]; then
     echo "agent"
     return
   fi
@@ -791,11 +1086,18 @@ derive_entry_label() {
 effective_entry_status() {
   local pane_id="$1"
   local kind="$2"
-  local status last_done ttl now age
+  local status last_done ttl now age pane_state
 
   status="$(stored_entry_status "$pane_id")"
   if [[ -n "$status" ]] && ! valid_entry_status "$status"; then
     status=""
+  fi
+
+  if [[ -z "$status" ]]; then
+    pane_state="$(pane_option "$pane_id" @pi_session_state)"
+    if valid_entry_status "$pane_state"; then
+      status="$pane_state"
+    fi
   fi
 
   if [[ "$status" == "done" ]]; then
@@ -933,7 +1235,7 @@ collect_entry_lines() {
       fi
     fi
 
-    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "" "$pane_title" "$pane_command")"
+    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "" "$pane_title" "$pane_command" "$pane_id")"
     if [[ "$stored_kind" == "agent" && "$provider" != "pi" && "$provider" != "codex" && "$provider" != "claude" ]] && is_shell_command "$pane_command" && is_generic_host_title "$pane_title"; then
       stored_kind="pane"
       remember_entry_kind "$pane_id" pane
@@ -1122,9 +1424,15 @@ cleanup_store_state() {
 }
 
 cleanup_dead_panes() {
-  local line session_id pane_id pane_dead pane_title _window_name store_session cleaned=0 key
+  local line session_id pane_id pane_dead pane_title _window_name store_session cleaned=0 key managed_removed=0
+  local -A existing_panes=() seen_keys=()
   store_session="$(store_session_id)"
   load_session_metadata_cache
+
+  while IFS= read -r pane_id; do
+    [[ -n "$pane_id" ]] || continue
+    existing_panes["${pane_id#%}"]=1
+  done < <(tmux list-panes -a -F '#{pane_id}')
 
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
@@ -1135,6 +1443,9 @@ cleanup_dead_panes() {
     [[ "$pane_dead" == "1" ]] || continue
     key="${pane_id#%}"
     if [[ -n "${ENTRY_LABEL_CACHE[$key]:-}" || -n "${ENTRY_KIND_CACHE[$key]:-}" || -n "${ENTRY_PROVIDER_CACHE[$key]:-}" || "$pane_title" == __agents_sidebar_* ]]; then
+      if [[ "$pane_title" != __agents_sidebar_* ]]; then
+        managed_removed=1
+      fi
       clear_entry_metadata "$pane_id"
       tmux kill-pane -t "$pane_id" 2>/dev/null || true
       cleaned=1
@@ -1151,9 +1462,24 @@ cleanup_dead_panes() {
     unset_option @agents_sidebar_pane
   fi
 
+  for key in "${!ENTRY_LABEL_CACHE[@]}" "${!ENTRY_KIND_CACHE[@]}" "${!ENTRY_PROVIDER_CACHE[@]}"; do
+    [[ -n "$key" ]] || continue
+    [[ -n "${seen_keys[$key]:-}" ]] && continue
+    seen_keys["$key"]=1
+    [[ -n "${existing_panes[$key]:-}" ]] && continue
+    if [[ -n "${ENTRY_LABEL_CACHE[$key]:-}" || -n "${ENTRY_KIND_CACHE[$key]:-}" || -n "${ENTRY_PROVIDER_CACHE[$key]:-}" ]]; then
+      managed_removed=1
+      clear_entry_metadata "%$key"
+      cleaned=1
+    fi
+  done
+
   cleanup_store_state
 
   if [[ "$cleaned" == "1" ]]; then
+    if [[ "$(get_option @agents_sidebar_mode)" == 'compact' && "$managed_removed" == '1' ]]; then
+      mark_wide_layout_dirty
+    fi
     bump_epoch
   fi
 }
@@ -1184,6 +1510,22 @@ start_sidebar() {
   tmux respawn-pane -k -t "$sidebar_pane" "$(sidebar_command)"
 }
 
+cleanup_duplicate_sidebar_panes() {
+  local keep_pane="${1:-}"
+  local target_window="${2:-$(get_option @agents_sidebar_compact_window)}"
+  local pane_id pane_title
+
+  [[ -n "$target_window" ]] || return 0
+  window_exists "$target_window" || return 0
+
+  while IFS=$'\t' read -r pane_id pane_title; do
+    [[ -n "$pane_id" ]] || continue
+    [[ "$pane_title" == "__agents_sidebar_nav" ]] || continue
+    [[ -n "$keep_pane" && "$pane_id" == "$keep_pane" ]] && continue
+    tmux kill-pane -t "$pane_id" 2>/dev/null || true
+  done < <(tmux list-panes -t "$target_window" -F '#{pane_id}	#{pane_title}')
+}
+
 ensure_sidebar() {
   local compact_window focus_pane sidebar_pane width
   compact_window="$(get_option @agents_sidebar_compact_window)"
@@ -1196,13 +1538,14 @@ ensure_sidebar() {
   pane_exists "$focus_pane" || fail "focus pane no longer exists"
 
   if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
+    cleanup_duplicate_sidebar_panes "$sidebar_pane" "$compact_window"
     if pane_is_dead "$sidebar_pane"; then
       start_sidebar "$sidebar_pane" "$compact_window"
     fi
     return 0
   fi
 
-  width="$(sidebar_width)"
+  width="$(sidebar_width "$compact_window")"
   sidebar_pane="$(create_sidebar_pane "$focus_pane" "$width" "$compact_window")"
   set_option @agents_sidebar_pane "$sidebar_pane"
   start_sidebar "$sidebar_pane" "$compact_window"
@@ -1229,23 +1572,37 @@ choose_active_name_for_compact() {
 }
 
 cmd_compact() {
-  local mode wide_name width compact_window sidebar_pane active_name active_pane active_session active_path active_window_name
+  local status
+
+  acquire_mode_transition_lock || return 0
+  set +e
+  _cmd_compact_impl
+  status=$?
+  set -e
+  end_mode_transition
+  release_mode_transition_lock
+  return "$status"
+}
+
+_cmd_compact_impl() {
+  local mode wide_name width compact_window sidebar_pane active_name active_pane active_session active_path active_window_name compact_reason
   local host_placeholder old_sidebar
   local -a entry_lines
   local line label pane_id _window_id _window_name _kind
 
+  clear_pending_auto_compact
   cleanup_dead_panes
   mode="$(get_option @agents_sidebar_mode)"
   if [[ "$mode" == 'compact' ]]; then
     compact_window="$(get_option @agents_sidebar_compact_window)"
     if [[ -z "$compact_window" ]] || ! window_exists "$compact_window"; then
-      cmd_wide >/dev/null
+      _cmd_wide_impl >/dev/null
     else
       cmd_refresh >/dev/null
       ensure_sidebar
       tmux select-window -t "$compact_window"
       tmux select-pane -t "$(get_option @agents_sidebar_focus_pane)"
-      return
+      return 0
     fi
   fi
 
@@ -1257,9 +1614,11 @@ cmd_compact() {
     wide_name="$(wide_window_name_default)"
   fi
   wide_name="${wide_name:-$(wide_window_name_default)}"
-  width="$(sidebar_width)"
+  save_wide_layout "$(current_window_id)"
+  begin_mode_transition
   active_name="$(choose_active_name_for_compact)"
   active_pane="$(entry_pane_by_name "$active_name")"
+  width="$(sidebar_width "$active_pane")"
   active_session="$(pane_session_id "$active_pane")"
   active_window_name="$(tmux display-message -p -t "$active_pane" '#{window_name}')"
 
@@ -1291,9 +1650,15 @@ cmd_compact() {
 
   sidebar_pane="$(create_sidebar_pane "$active_pane" "$width" "$compact_window")"
 
+  compact_reason="$(get_option @agents_sidebar_compact_reason)"
+  if [[ "$compact_reason" != "auto-narrow" ]]; then
+    set_option @agents_sidebar_compact_reason manual
+  fi
+
   set_option @agents_sidebar_mode compact
   set_option @agents_sidebar_compact_window "$compact_window"
   set_option @agents_sidebar_pane "$sidebar_pane"
+  cleanup_duplicate_sidebar_panes "$sidebar_pane" "$compact_window"
   set_option @agents_sidebar_focus_pane "$active_pane"
   set_option @agents_sidebar_active_name "$active_name"
   set_option @agents_sidebar_last_active_name ''
@@ -1308,16 +1673,48 @@ cmd_compact() {
 }
 
 cmd_wide() {
-  local mode compact_window sidebar_pane active_pane target_window wide_name
-  local line _label pane_id _window_id _window_name
+  local status
 
+  LAST_WIDE_TARGET_WINDOW=""
+  acquire_mode_transition_lock || return 0
+  set +e
+  _cmd_wide_impl
+  status=$?
+  set -e
+  end_mode_transition
+  release_mode_transition_lock
+  if [[ "$status" -eq 0 && -n "$LAST_WIDE_TARGET_WINDOW" ]]; then
+    save_wide_layout "$LAST_WIDE_TARGET_WINDOW"
+  fi
+  LAST_WIDE_TARGET_WINDOW=""
+  return "$status"
+}
+
+_cmd_wide_impl() {
+  local mode compact_window sidebar_pane active_pane target_window wide_name saved_active_pane saved_layout
+  local line _label pane_id _window_id _window_name current_window
+
+  clear_pending_auto_compact
+  begin_mode_transition
   cleanup_dead_panes
   mode="$(get_option @agents_sidebar_mode)"
   if [[ "$mode" != 'compact' ]]; then
+    current_window="$(current_window_id)"
+    cleanup_duplicate_sidebar_panes "" "$current_window"
+    if [[ -n "$current_window" ]] && window_exists "$current_window"; then
+      tmux select-layout -t "$current_window" even-horizontal >/dev/null 2>&1 || true
+    else
+      tmux select-layout even-horizontal >/dev/null 2>&1 || true
+    fi
     kill_store_session
-    tmux select-layout even-horizontal >/dev/null 2>&1 || true
+    unset_option @agents_sidebar_pane
+    unset_option @agents_sidebar_compact_window
+    unset_option @agents_sidebar_focus_pane
+    unset_option @agents_sidebar_last_active_name
+    unset_option @agents_sidebar_compact_reason
+    unset_option @agents_sidebar_auto_mode_client
     set_option @agents_sidebar_mode wide
-    return
+    return 0
   fi
 
   compact_window="$(get_option @agents_sidebar_compact_window)"
@@ -1327,6 +1724,7 @@ cmd_wide() {
   wide_name="${wide_name:-$(wide_window_name_default)}"
   target_window="$compact_window"
 
+  cleanup_duplicate_sidebar_panes "$sidebar_pane" "$compact_window"
   if [[ -n "$sidebar_pane" ]] && pane_exists "$sidebar_pane"; then
     remember_sidebar_width "$sidebar_pane"
     tmux kill-pane -t "$sidebar_pane"
@@ -1348,13 +1746,26 @@ cmd_wide() {
   if [[ -n "$target_window" ]] && window_exists "$target_window"; then
     tmux rename-window -t "$target_window" "$wide_name" >/dev/null 2>&1 || true
     tmux select-window -t "$target_window"
-    if [[ -n "$active_pane" ]] && pane_exists "$active_pane"; then
+
+    saved_layout="$(get_option @agents_sidebar_wide_layout)"
+    saved_active_pane="$(get_option @agents_sidebar_wide_layout_active_pane)"
+    if saved_wide_layout_exists && ! saved_wide_layout_dirty && saved_wide_layout_matches_current_panes "$target_window"; then
+      tmux select-layout -t "$target_window" "$saved_layout" >/dev/null 2>&1 || tmux select-layout -t "$target_window" even-horizontal >/dev/null 2>&1 || true
+    else
+      tmux select-layout -t "$target_window" even-horizontal >/dev/null 2>&1 || true
+    fi
+
+    if [[ -n "$saved_active_pane" ]] && pane_exists "$saved_active_pane"; then
+      tmux select-pane -t "$saved_active_pane"
+    elif [[ -n "$active_pane" ]] && pane_exists "$active_pane"; then
       tmux select-pane -t "$active_pane"
     fi
-    tmux select-layout -t "$target_window" even-horizontal >/dev/null 2>&1 || true
   fi
 
   set_option @agents_sidebar_mode wide
+  unset_option @agents_sidebar_compact_reason
+  unset_option @agents_sidebar_auto_mode_client
+  LAST_WIDE_TARGET_WINDOW="$target_window"
   bump_epoch
   unset_option @agents_sidebar_compact_window
   unset_option @agents_sidebar_pane
@@ -1514,8 +1925,21 @@ refresh_active_state() {
 }
 
 cmd_repair() {
+  local status
+
+  mode_transition_active && return 0
+  acquire_repair_lock || return 0
+  set +e
+  _cmd_repair_impl
+  status=$?
+  set -e
+  release_repair_lock
+  return "$status"
+}
+
+_cmd_repair_impl() {
   local mode compact_window focus_pane first_name first_pane
-  with_repair_lock || return 0
+
   cleanup_dead_panes
   mode="$(get_option @agents_sidebar_mode)"
   [[ "$mode" == 'compact' ]] || return 0
@@ -1558,6 +1982,7 @@ cmd_kill_current() {
   target_pane="$(current_pane_id)"
 
   if [[ "$mode" == 'compact' ]]; then
+    mark_wide_layout_dirty
     sidebar_pane="$(get_option @agents_sidebar_pane)"
     focus_pane="$(get_option @agents_sidebar_focus_pane)"
     if [[ -n "$sidebar_pane" && "$target_pane" == "$sidebar_pane" ]]; then
@@ -1604,6 +2029,7 @@ cmd_new() {
   source_path="$(tmux display-message -p -t "$source_pane" '#{pane_current_path}')"
 
   if [[ "$mode" == 'compact' ]]; then
+    mark_wide_layout_dirty
     compact_window="$(get_option @agents_sidebar_compact_window)"
     focus_pane="$(get_option @agents_sidebar_focus_pane)"
     active_name="$(get_option @agents_sidebar_active_name)"
@@ -1752,6 +2178,72 @@ cmd_refresh() {
   refresh_active_state
 }
 
+cmd_save_wide_layout() {
+  cleanup_dead_panes
+  save_wide_layout
+}
+
+cmd_maybe_auto_compact() {
+  local mode width compact_threshold client_count client_tty token
+
+  mode_transition_active && return 0
+  cleanup_dead_panes
+  option_is_enabled "$(auto_compact_on_narrow)" || return 0
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" != 'compact' ]] || return 0
+
+  client_count="$(session_client_count)"
+  if [[ "$client_count" != "1" ]]; then
+    clear_pending_auto_compact
+    return 0
+  fi
+
+  client_tty="$(current_client_tty)"
+  width="$(current_client_width)"
+  compact_threshold="$(auto_compact_width)"
+  if [[ ! "$width" =~ ^[0-9]+$ || ! "$compact_threshold" =~ ^[0-9]+$ ]]; then
+    clear_pending_auto_compact
+    return 0
+  fi
+  if (( width > compact_threshold )); then
+    clear_pending_auto_compact
+    return 0
+  fi
+
+  token="$(auto_compact_token)"
+  set_option @agents_sidebar_auto_mode_client "$client_tty"
+  set_option @agents_sidebar_pending_auto_compact 1
+  set_option @agents_sidebar_pending_auto_compact_token "$token"
+  set_option @agents_sidebar_pending_auto_compact_client "$client_tty"
+  schedule_auto_compact_run "$token" "$client_tty"
+}
+
+cmd_run_auto_compact() {
+  local token="$1"
+  local mode width compact_threshold client_count current_token
+
+  mode_transition_active && return 0
+  current_token="$(get_option @agents_sidebar_pending_auto_compact_token)"
+  [[ -n "$token" && "$token" == "$current_token" ]] || return 0
+
+  cleanup_dead_panes
+  option_is_enabled "$(auto_compact_on_narrow)" || { clear_pending_auto_compact; return 0; }
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" != 'compact' ]] || { clear_pending_auto_compact; return 0; }
+
+  client_count="$(session_client_count)"
+  [[ "$client_count" == "1" ]] || { clear_pending_auto_compact; return 0; }
+
+  width="$(current_client_width)"
+  compact_threshold="$(auto_compact_width)"
+  [[ "$width" =~ ^[0-9]+$ && "$compact_threshold" =~ ^[0-9]+$ ]] || { clear_pending_auto_compact; return 0; }
+  (( width <= compact_threshold )) || { clear_pending_auto_compact; return 0; }
+
+  set_option @agents_sidebar_compact_reason auto-narrow
+  save_wide_layout
+  cmd_compact
+}
+
 print_section() {
   local title="$1"
   shift
@@ -1782,6 +2274,9 @@ cmd_status() {
   echo "active_name: $(get_option @agents_sidebar_active_name)"
   echo "last_active_name: $(get_option @agents_sidebar_last_active_name)"
   echo "wide_window_name: $(get_option @agents_sidebar_wide_window_name)"
+  echo "compact_reason: $(get_option @agents_sidebar_compact_reason)"
+  echo "saved_wide_layout_dirty: $(get_option @agents_sidebar_wide_layout_dirty)"
+  echo "saved_wide_layout_window: $(get_option @agents_sidebar_wide_layout_window)"
   echo
   print_section "agents" ordered_agent_lines
   echo
@@ -1794,8 +2289,8 @@ usage: agents-sidebar <command> [args]
 
 commands:
   compact                       switch to compact sidebar layout
-  wide                          restore all managed panes into an even-horizontal wide layout
-  new                           create a new managed agent pane and auto-label it from pane context
+  wide                          restore all managed panes into the saved wide layout or an even-horizontal fallback
+  new                           create a new managed pane
   kill-current                  kill the current managed pane and repair compact mode
   repair                        repair compact mode after pane loss or stale state
   focus <name>                  focus the named entry in compact mode
@@ -1818,6 +2313,9 @@ commands:
   snapshot                      print a compact sidebar state snapshot
   cleanup-dead                  remove stale dead managed panes
   refresh                       refresh compact-mode state
+  save-wide-layout              save the current wide layout snapshot
+  maybe-auto-compact            debounce and queue compact mode if the attached client is narrow enough
+  run-auto-compact <token>      execute a queued auto-compact transition if still valid
   status                        print current state and discovered entries
 EOF
 }
@@ -1905,6 +2403,16 @@ main() {
       ;;
     refresh)
       cmd_refresh
+      ;;
+    save-wide-layout)
+      cmd_save_wide_layout
+      ;;
+    maybe-auto-compact)
+      cmd_maybe_auto_compact
+      ;;
+    run-auto-compact)
+      [[ $# -ge 2 ]] || fail "run-auto-compact requires <token>"
+      cmd_run_auto_compact "$2"
       ;;
     status)
       cmd_status
