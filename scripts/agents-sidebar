@@ -205,6 +205,36 @@ agent_order_string() {
   echo "${value:-$DEFAULT_AGENT_ORDER}"
 }
 
+manual_agent_order_string() {
+  local value
+  value="$(get_option @agents_sidebar_manual_agent_order)"
+  echo "${value:-}"
+}
+
+manual_pane_order_string() {
+  local value
+  value="$(get_option @agents_sidebar_manual_pane_order)"
+  echo "${value:-}"
+}
+
+set_manual_agent_order() {
+  local value="$*"
+  if [[ -n "$value" ]]; then
+    set_option @agents_sidebar_manual_agent_order "$value"
+  else
+    unset_option @agents_sidebar_manual_agent_order
+  fi
+}
+
+set_manual_pane_order() {
+  local value="$*"
+  if [[ -n "$value" ]]; then
+    set_option @agents_sidebar_manual_pane_order "$value"
+  else
+    unset_option @agents_sidebar_manual_pane_order
+  fi
+}
+
 done_status_ttl() {
   local value
   value="$(get_option @agents_sidebar_done_ttl)"
@@ -1353,8 +1383,8 @@ discover_entries() {
 
 ordered_entry_lines() {
   local -a lines agent_records pane_records
-  local -A order_index
-  local line label _pane_id _window_id _window_name kind sort_label priority sequence
+  local -A order_index manual_agent_index manual_pane_index
+  local line label pane_id _window_id _window_name kind sort_label priority sequence manual_priority
 
   lines=()
   agent_records=()
@@ -1368,24 +1398,38 @@ ordered_entry_lines() {
   done
 
   sequence=0
+  for pane_id in $(manual_agent_order_string); do
+    manual_agent_index["$pane_id"]="$sequence"
+    sequence=$((sequence + 1))
+  done
+
+  sequence=0
+  for pane_id in $(manual_pane_order_string); do
+    manual_pane_index["$pane_id"]="$sequence"
+    sequence=$((sequence + 1))
+  done
+
+  sequence=0
   for line in "${lines[@]}"; do
     [[ -n "$line" ]] || continue
-    IFS="$DELIM" read -r label _pane_id _window_id _window_name kind _rest <<<"$line"
+    IFS="$DELIM" read -r label pane_id _window_id _window_name kind _rest <<<"$line"
     sort_label="${label,,}"
     if [[ "$kind" == "agent" ]]; then
       priority="${order_index[$label]:-9999}"
-      agent_records+=("$(printf '%08d%s%s%s%08d%s%s' "$priority" "$DELIM" "$sort_label" "$DELIM" "$sequence" "$DELIM" "$line")")
+      manual_priority="${manual_agent_index[$pane_id]:-999999}"
+      agent_records+=("$(printf '%08d%s%08d%s%s%s%08d%s%s' "$manual_priority" "$DELIM" "$priority" "$DELIM" "$sort_label" "$DELIM" "$sequence" "$DELIM" "$line")")
     else
-      pane_records+=("$(printf '%s%s%08d%s%s' "$sort_label" "$DELIM" "$sequence" "$DELIM" "$line")")
+      manual_priority="${manual_pane_index[$pane_id]:-999999}"
+      pane_records+=("$(printf '%08d%s%s%s%08d%s%s' "$manual_priority" "$DELIM" "$sort_label" "$DELIM" "$sequence" "$DELIM" "$line")")
     fi
     sequence=$((sequence + 1))
   done
 
   if ((${#agent_records[@]} > 0)); then
-    printf '%s\n' "${agent_records[@]}" | sort -t "$DELIM" -k1,1n -k2,2 -k3,3n | cut -d "$DELIM" -f4-
+    printf '%s\n' "${agent_records[@]}" | sort -t "$DELIM" -k1,1n -k2,2n -k3,3 -k4,4n | cut -d "$DELIM" -f5-
   fi
   if ((${#pane_records[@]} > 0)); then
-    printf '%s\n' "${pane_records[@]}" | sort -t "$DELIM" -k1,1 -k2,2n | cut -d "$DELIM" -f3-
+    printf '%s\n' "${pane_records[@]}" | sort -t "$DELIM" -k1,1n -k2,2 -k3,3n | cut -d "$DELIM" -f4-
   fi
 }
 
@@ -1530,6 +1574,44 @@ append_agent_order() {
   set_option @agents_sidebar_order "$order $label"
 }
 
+prune_manual_order_option() {
+  local option_name="$1"
+  local target_kind="$2"
+  local value pane_id line _label current_pane_id _window_id _window_name kind _rest new_value
+  local -a kept=()
+  local -A valid=() seen=()
+
+  value="$(get_option "$option_name")"
+  [[ -n "$value" ]] || return 1
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r _label current_pane_id _window_id _window_name kind _rest <<<"$line"
+    if [[ "$kind" == "$target_kind" ]]; then
+      valid["$current_pane_id"]=1
+    fi
+  done < <(discover_entries)
+
+  for pane_id in $value; do
+    [[ -n "${valid[$pane_id]:-}" ]] || continue
+    [[ -n "${seen[$pane_id]:-}" ]] && continue
+    seen["$pane_id"]=1
+    kept+=("$pane_id")
+  done
+
+  new_value="${kept[*]}"
+  if [[ "$new_value" != "$value" ]]; then
+    if [[ -n "$new_value" ]]; then
+      set_option "$option_name" "$new_value"
+    else
+      unset_option "$option_name"
+    fi
+    return 0
+  fi
+
+  return 1
+}
+
 cleanup_store_state() {
   local store_session store_window expected_store_name actual_store_name actual_window_name owner_session
   store_session="$(store_session_id)"
@@ -1612,7 +1694,7 @@ cleanup_visible_store_windows_in_session() {
 }
 
 cleanup_dead_panes() {
-  local line session_id pane_id pane_dead pane_title _window_name store_session cleaned=0 key managed_removed=0
+  local line session_id pane_id pane_dead pane_title _window_name store_session cleaned=0 key managed_removed=0 order_pruned=0
   local -A existing_panes=() seen_keys=()
 
   store_session="$(store_session_id)"
@@ -1663,11 +1745,18 @@ cleanup_dead_panes() {
     fi
   done
 
+  if prune_manual_order_option @agents_sidebar_manual_agent_order agent; then
+    order_pruned=1
+  fi
+  if prune_manual_order_option @agents_sidebar_manual_pane_order pane; then
+    order_pruned=1
+  fi
+
   if [[ "$(get_option @agents_sidebar_mode)" != 'compact' ]]; then
     cleanup_store_state
   fi
 
-  if [[ "$cleaned" == "1" ]]; then
+  if [[ "$cleaned" == "1" || "$order_pruned" == "1" ]]; then
     if [[ "$(get_option @agents_sidebar_mode)" == 'compact' && "$managed_removed" == '1' ]]; then
       mark_wide_layout_dirty
     fi
@@ -2074,6 +2163,74 @@ cmd_focus_keep_sidebar() {
     tmux select-window -t "$compact_window"
     tmux select-pane -t "$sidebar_pane"
   fi
+}
+
+cmd_move_entry() {
+  local direction="$1"
+  local target="${2:-}"
+  local mode target_kind target_pane line label pane_id _window_id _window_name kind _rest current_index swap_index
+  local -a lines pane_ids
+
+  cleanup_dead_panes
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" == 'compact' ]] || fail "move only works in compact mode"
+
+  if [[ -z "$target" ]]; then
+    target="$(get_option @agents_sidebar_active_name)"
+  fi
+  [[ -n "$target" ]] || fail "move requires an entry name"
+
+  target_kind=""
+  target_pane=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r label pane_id _window_id _window_name kind _rest <<<"$line"
+    if [[ "$label" == "$target" ]]; then
+      target_kind="$kind"
+      target_pane="$pane_id"
+      break
+    fi
+  done < <(ordered_entry_lines)
+
+  [[ -n "$target_kind" && -n "$target_pane" ]] || fail "entry '$target' not found"
+
+  if [[ "$target_kind" == "agent" ]]; then
+    mapfile -t lines < <(ordered_agent_lines)
+  else
+    mapfile -t lines < <(ordered_pane_lines)
+  fi
+
+  pane_ids=()
+  current_index=-1
+  for i in "${!lines[@]}"; do
+    [[ -n "${lines[$i]}" ]] || continue
+    IFS="$DELIM" read -r _label pane_id _rest <<<"${lines[$i]}"
+    pane_ids+=("$pane_id")
+    if [[ "$pane_id" == "$target_pane" ]]; then
+      current_index="$i"
+    fi
+  done
+
+  (( current_index >= 0 )) || fail "entry '$target' is not movable"
+
+  if [[ "$direction" == 'up' ]]; then
+    (( current_index > 0 )) || return 0
+    swap_index=$((current_index - 1))
+  else
+    (( current_index + 1 < ${#pane_ids[@]} )) || return 0
+    swap_index=$((current_index + 1))
+  fi
+
+  pane_id="${pane_ids[$current_index]}"
+  pane_ids[$current_index]="${pane_ids[$swap_index]}"
+  pane_ids[$swap_index]="$pane_id"
+
+  if [[ "$target_kind" == "agent" ]]; then
+    set_manual_agent_order "${pane_ids[*]}"
+  else
+    set_manual_pane_order "${pane_ids[*]}"
+  fi
+  bump_epoch
 }
 
 cmd_next_prev() {
@@ -2599,6 +2756,8 @@ commands:
   toggle-last                   jump back to the previously focused entry
   focus-sidebar                 move keyboard focus to the sidebar pane
   focus-right                   move keyboard focus to the active pane
+  move-up <name>                move the named compact row up within its section
+  move-down <name>              move the named compact row down within its section
   register <pane>               classify a pane as an agent using its live-derived label
   mark-agent <pane> [provider]  classify a pane as an agent
   mark-pane <pane>              classify a pane as a regular pane
@@ -2666,6 +2825,14 @@ main() {
       ;;
     focus-right)
       cmd_focus_right
+      ;;
+    move-up)
+      [[ $# -ge 2 ]] || fail "move-up requires an entry name"
+      cmd_move_entry up "$2"
+      ;;
+    move-down)
+      [[ $# -ge 2 ]] || fail "move-down requires an entry name"
+      cmd_move_entry down "$2"
       ;;
     register)
       [[ $# -ge 2 ]] || fail "register requires <pane-id>"

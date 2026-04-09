@@ -97,6 +97,7 @@ class SidebarApp:
         self.message = ""
         self.message_until = 0.0
         self.last_repair_attempt_at = 0.0
+        self.selection_label_hint: Optional[str] = None
 
     def run_controller(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run([self.controller, *args], capture_output=True, text=True)
@@ -191,6 +192,11 @@ class SidebarApp:
         names = [entry.label for entry in ordered]
         if self.selected_index >= len(names):
             self.selected_index = len(names) - 1
+
+        if self.selection_label_hint and self.selection_label_hint in names:
+            self.selected_index = names.index(self.selection_label_hint)
+            self.selection_label_hint = None
+            return
 
         if previous is None:
             if current.active_name in names:
@@ -416,8 +422,8 @@ class SidebarApp:
         lines.append(self.render_line(self.pad_plain(f" last   {state.last_active_name or '—'}", width), DIM))
         lines.append(self.render_line(self.pad_plain(f" counts a:{agents_count} p:{panes_count}  mode {state.mode or '—'}", width), DIM))
         lines.append(self.render_line(self.pad_plain(" enter switch  esc active", width), FG_GRAY))
-        lines.append(self.render_line(self.pad_plain(" j/k move  n/p cycle", width), FG_GRAY))
-        lines.append(self.render_line(self.pad_plain(" 1-9 direct  r refresh", width), FG_GRAY))
+        lines.append(self.render_line(self.pad_plain(" j/k move  J/K reorder", width), FG_GRAY))
+        lines.append(self.render_line(self.pad_plain(" n/p cycle  1-9 direct  r refresh", width), FG_GRAY))
 
         if self.message:
             lines.append(self.render_line(self.pad_plain(f" {self.message}", width), FG_YELLOW, BOLD))
@@ -463,6 +469,18 @@ class SidebarApp:
         if proc.returncode != 0:
             raise SidebarError(proc.stderr.strip() or proc.stdout.strip() or error_message)
         self.force_snapshot = True
+
+    def reorder_selected(self, direction: str) -> None:
+        entry = self.selected_entry()
+        if entry is None:
+            return
+        command = "move-up" if direction == "up" else "move-down"
+        proc = self.run_controller(command, entry.label)
+        if proc.returncode != 0:
+            raise SidebarError(proc.stderr.strip() or proc.stdout.strip() or f"failed to move {entry.label}")
+        self.selection_label_hint = entry.label
+        self.force_snapshot = True
+        self.set_message(f"moved {entry.label} {direction}", 1.0)
 
     def move_selection(self, delta: int) -> None:
         if self.state is None:
@@ -572,6 +590,12 @@ class SidebarApp:
             entry = self.selected_entry()
             if entry is not None:
                 self.focus_name(entry.label, keep_sidebar=True)
+            return
+        if key == "K":
+            self.reorder_selected("up")
+            return
+        if key == "J":
+            self.reorder_selected("down")
             return
         if key in ("escape", "q"):
             self.controller_command("focus-right", "failed to focus active pane")

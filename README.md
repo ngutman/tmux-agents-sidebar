@@ -101,6 +101,7 @@ Default key bindings:
 - `prefix a` — focus the sidebar pane
 - `prefix x` — compact-aware kill for the current managed pane
 - `prefix ]` / `prefix [` — next / previous entry
+- inside the compact sidebar UI: `j` / `k` move selection, `J` / `K` move the selected row down / up within its section
 - `prefix Down` / `prefix Up` — next / previous entry
 - `prefix Tab` — toggle last active entry
 
@@ -121,6 +122,8 @@ Default key bindings:
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar toggle-last
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar focus-sidebar
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar focus-right
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar move-up <name>
+~/projects/tmux-agents-sidebar/scripts/agents-sidebar move-down <name>
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar register <pane-id>
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar mark-agent <pane-id> [provider]
 ~/projects/tmux-agents-sidebar/scripts/agents-sidebar mark-pane <pane-id>
@@ -156,6 +159,7 @@ Notes:
 - auto-compact is debounced slightly so it runs after resize activity settles, not during the resize storm
 - auto-compact only runs when exactly one tmux client is attached to the session
 - labels are derived live from pane title, cwd, git branch, and command/provider heuristics
+- compact sidebar row reordering is manual and stays within the `Agents` or `Panes` section for the current tmux session
 - labels are made unique automatically when multiple panes would otherwise collide
 - branch labels are derived from each pane's own working directory, not from a shared tmux variable
 - manual pane naming is currently disabled; use pane titles or cwd/branch context instead
