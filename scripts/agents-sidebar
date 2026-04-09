@@ -309,6 +309,45 @@ pane_window_id() {
   tmux display-message -p -t "$1" '#{window_id}'
 }
 
+session_name_by_id() {
+  local target_session="$1"
+  local session_id session_name match=""
+
+  while IFS="$DELIM" read -r session_id session_name; do
+    if [[ -z "$match" && "$session_id" == "$target_session" ]]; then
+      match="$session_name"
+    fi
+  done < <(tmux list-sessions -F "#{session_id}${DELIM}#{session_name}" 2>/dev/null || true)
+
+  echo "$match"
+}
+
+window_name_by_id() {
+  local target_window="$1"
+  local window_id window_name match=""
+
+  while IFS="$DELIM" read -r window_id window_name; do
+    if [[ -z "$match" && "$window_id" == "$target_window" ]]; then
+      match="$window_name"
+    fi
+  done < <(tmux list-windows -a -F "#{window_id}${DELIM}#{window_name}" 2>/dev/null || true)
+
+  echo "$match"
+}
+
+window_session_id() {
+  local target_window="$1"
+  local window_id session_id match=""
+
+  while IFS="$DELIM" read -r window_id session_id; do
+    if [[ -z "$match" && "$window_id" == "$target_window" ]]; then
+      match="$session_id"
+    fi
+  done < <(tmux list-windows -a -F "#{window_id}${DELIM}#{session_id}" 2>/dev/null || true)
+
+  echo "$match"
+}
+
 pane_option() {
   local pane_id="$1"
   local option_name="$2"
@@ -1492,23 +1531,90 @@ append_agent_order() {
 }
 
 cleanup_store_state() {
-  local store_session store_window
+  local store_session store_window expected_store_name actual_store_name actual_window_name owner_session
   store_session="$(store_session_id)"
   store_window="$(store_window_id)"
 
-  if [[ -n "$store_session" ]] && ! session_exists "$store_session"; then
+  if [[ -n "$store_session" && -z "$store_window" ]] || [[ -z "$store_session" && -n "$store_window" ]]; then
     clear_store_state
     return 0
   fi
 
-  if [[ -n "$store_window" ]] && ! window_exists "$store_window"; then
-    clear_store_state
+  if [[ -n "$store_session" ]]; then
+    if ! session_exists "$store_session"; then
+      clear_store_state
+      return 0
+    fi
+
+    expected_store_name="$(store_session_name)"
+    actual_store_name="$(session_name_by_id "$store_session")"
+    if [[ -z "$actual_store_name" || "$actual_store_name" != "$expected_store_name" ]]; then
+      clear_store_state
+      return 0
+    fi
+  fi
+
+  if [[ -n "$store_window" ]]; then
+    if ! window_exists "$store_window"; then
+      clear_store_state
+      return 0
+    fi
+
+    actual_window_name="$(window_name_by_id "$store_window")"
+    owner_session="$(window_session_id "$store_window")"
+    if [[ -z "$actual_window_name" || "$actual_window_name" != "$(store_window_name)" ]]; then
+      clear_store_state
+      return 0
+    fi
+    if [[ -z "$owner_session" || "$owner_session" == "$SESSION_ID" ]]; then
+      clear_store_state
+      return 0
+    fi
+    if [[ -n "$store_session" && "$owner_session" != "$store_session" ]]; then
+      clear_store_state
+      return 0
+    fi
+  fi
+}
+
+cleanup_visible_store_windows_in_session() {
+  local internal_store_name store_window window_id window_name pane_ids pane_id changed=0
+
+  internal_store_name="$(store_window_name)"
+  store_window="$(store_window_id)"
+
+  while IFS="$DELIM" read -r window_id window_name; do
+    [[ "$window_name" == "$internal_store_name" ]] || continue
+
+    pane_ids="$(managed_pane_ids_in_window "$window_id")"
+    if [[ -n "$pane_ids" ]]; then
+      clear_store_state
+      for pane_id in $pane_ids; do
+        pane_exists "$pane_id" || continue
+        tmux join-pane -d -s "$pane_id" -t "$(store_target_pane)"
+        changed=1
+      done
+    fi
+
+    if window_exists "$window_id" && [[ -z "$(managed_pane_ids_in_window "$window_id")" ]]; then
+      tmux kill-window -t "$window_id" 2>/dev/null || true
+      changed=1
+    fi
+
+    if [[ "$window_id" == "$store_window" ]]; then
+      clear_store_state
+    fi
+  done < <(tmux list-windows -t "$SESSION_ID" -F "#{window_id}${DELIM}#{window_name}" 2>/dev/null || true)
+
+  if [[ "$changed" == "1" ]]; then
+    bump_epoch
   fi
 }
 
 cleanup_dead_panes() {
   local line session_id pane_id pane_dead pane_title _window_name store_session cleaned=0 key managed_removed=0
   local -A existing_panes=() seen_keys=()
+
   store_session="$(store_session_id)"
   load_session_metadata_cache
 
@@ -1557,7 +1663,9 @@ cleanup_dead_panes() {
     fi
   done
 
-  cleanup_store_state
+  if [[ "$(get_option @agents_sidebar_mode)" != 'compact' ]]; then
+    cleanup_store_state
+  fi
 
   if [[ "$cleaned" == "1" ]]; then
     if [[ "$(get_option @agents_sidebar_mode)" == 'compact' && "$managed_removed" == '1' ]]; then
@@ -1737,8 +1845,12 @@ _cmd_compact_impl() {
   local line label pane_id _window_id _window_name _kind
 
   clear_pending_auto_compact
-  cleanup_dead_panes
   mode="$(get_option @agents_sidebar_mode)"
+  if [[ "$mode" != 'compact' ]]; then
+    cleanup_store_state
+    cleanup_visible_store_windows_in_session
+  fi
+  cleanup_dead_panes
   if [[ "$mode" == 'compact' ]]; then
     compact_window="$(get_option @agents_sidebar_compact_window)"
     if [[ -z "$compact_window" ]] || ! window_exists "$compact_window"; then
