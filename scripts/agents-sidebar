@@ -10,7 +10,7 @@ MIN_SIDEBAR_WIDTH="20"
 MIN_MAIN_PANE_WIDTH="35"
 DEFAULT_WIDE_WINDOW_NAME="agents-sidebar"
 DEFAULT_DONE_TTL="20"
-BRANCH_CACHE_TTL="2"
+BRANCH_CACHE_TTL="5"
 AUTO_COMPACT_DEBOUNCE_SECONDS="0.4"
 DELIM=$'\x1f'
 HOST_FULL="$(hostname 2>/dev/null || true)"
@@ -26,6 +26,14 @@ declare -Ag ENTRY_LAST_DONE_CACHE=()
 declare -Ag ENTRY_BRANCH_VALUE_CACHE=()
 declare -Ag ENTRY_BRANCH_PATH_CACHE=()
 declare -Ag ENTRY_BRANCH_CHECKED_CACHE=()
+declare -a DISCOVERED_ENTRY_LINES_CACHE=()
+declare -a ORDERED_ENTRY_LINES_CACHE=()
+declare -a ORDERED_AGENT_LINES_CACHE=()
+declare -a ORDERED_PANE_LINES_CACHE=()
+DISCOVERED_ENTRY_LINES_CACHE_READY=0
+ORDERED_ENTRY_LINES_CACHE_READY=0
+ORDERED_AGENT_LINES_CACHE_READY=0
+ORDERED_PANE_LINES_CACHE_READY=0
 SESSION_METADATA_CACHE_LOADED=0
 
 clear_pending_auto_compact() {
@@ -138,6 +146,25 @@ bump_epoch() {
   set_option @agents_sidebar_epoch "$next"
 }
 
+current_epoch() {
+  if [[ -n "${EPOCHSECONDS:-}" ]]; then
+    echo "$EPOCHSECONDS"
+  else
+    date +%s
+  fi
+}
+
+invalidate_entry_caches() {
+  DISCOVERED_ENTRY_LINES_CACHE=()
+  ORDERED_ENTRY_LINES_CACHE=()
+  ORDERED_AGENT_LINES_CACHE=()
+  ORDERED_PANE_LINES_CACHE=()
+  DISCOVERED_ENTRY_LINES_CACHE_READY=0
+  ORDERED_ENTRY_LINES_CACHE_READY=0
+  ORDERED_AGENT_LINES_CACHE_READY=0
+  ORDERED_PANE_LINES_CACHE_READY=0
+}
+
 remember_sidebar_width() {
   local pane_id="${1:-$(get_option @agents_sidebar_pane)}"
   local width title
@@ -224,6 +251,7 @@ set_manual_agent_order() {
   else
     unset_option @agents_sidebar_manual_agent_order
   fi
+  invalidate_entry_caches
 }
 
 set_manual_pane_order() {
@@ -233,6 +261,7 @@ set_manual_pane_order() {
   else
     unset_option @agents_sidebar_manual_pane_order
   fi
+  invalidate_entry_caches
 }
 
 done_status_ttl() {
@@ -511,7 +540,7 @@ save_wide_layout() {
   set_option @agents_sidebar_wide_layout_panes "$pane_ids"
   set_option @agents_sidebar_wide_layout_active_pane "$active_pane"
   set_option @agents_sidebar_wide_layout_window "$window_id"
-  set_option @agents_sidebar_wide_layout_saved_at "$(date +%s)"
+  set_option @agents_sidebar_wide_layout_saved_at "$(current_epoch)"
   clear_wide_layout_dirty
 }
 
@@ -580,6 +609,7 @@ store_window_id() {
 clear_store_state() {
   unset_option @agents_sidebar_store_session
   unset_option @agents_sidebar_store_window
+  invalidate_entry_caches
 }
 
 kill_store_session() {
@@ -783,6 +813,7 @@ remember_entry_label() {
   set_option "$(label_option_key "$pane_id")" "$label"
   ENTRY_LABEL_CACHE["$key"]="$label"
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 clear_entry_label() {
@@ -792,6 +823,7 @@ clear_entry_label() {
   unset_option "$(label_option_key "$pane_id")"
   unset "ENTRY_LABEL_CACHE[$key]"
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_label_mode() {
@@ -816,6 +848,7 @@ remember_entry_label_mode() {
     unset "ENTRY_LABEL_MODE_CACHE[$key]"
   fi
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_kind() {
@@ -829,9 +862,13 @@ stored_entry_kind() {
 remember_entry_kind() {
   local pane_id="$1"
   local kind="$2"
-  local key
+  local key current
   [[ -n "$pane_id" ]] || return 0
   key="$(metadata_cache_key "$pane_id")"
+  current="${ENTRY_KIND_CACHE[$key]:-}"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" == "1" && "$current" == "$kind" ]]; then
+    return 0
+  fi
   if [[ -n "$kind" ]]; then
     set_option "$(meta_option_key "$pane_id" kind)" "$kind"
     ENTRY_KIND_CACHE["$key"]="$kind"
@@ -840,6 +877,7 @@ remember_entry_kind() {
     unset "ENTRY_KIND_CACHE[$key]"
   fi
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_provider() {
@@ -853,9 +891,13 @@ stored_entry_provider() {
 remember_entry_provider() {
   local pane_id="$1"
   local provider="$2"
-  local key
+  local key current
   [[ -n "$pane_id" ]] || return 0
   key="$(metadata_cache_key "$pane_id")"
+  current="${ENTRY_PROVIDER_CACHE[$key]:-}"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" == "1" && "$current" == "$provider" ]]; then
+    return 0
+  fi
   if [[ -n "$provider" ]]; then
     set_option "$(meta_option_key "$pane_id" provider)" "$provider"
     ENTRY_PROVIDER_CACHE["$key"]="$provider"
@@ -864,6 +906,7 @@ remember_entry_provider() {
     unset "ENTRY_PROVIDER_CACHE[$key]"
   fi
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_status() {
@@ -877,9 +920,13 @@ stored_entry_status() {
 remember_entry_status() {
   local pane_id="$1"
   local status="$2"
-  local key
+  local key current
   [[ -n "$pane_id" ]] || return 0
   key="$(metadata_cache_key "$pane_id")"
+  current="${ENTRY_STATUS_CACHE[$key]:-}"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" == "1" && "$current" == "$status" ]]; then
+    return 0
+  fi
   if [[ -n "$status" ]]; then
     set_option "$(meta_option_key "$pane_id" status)" "$status"
     ENTRY_STATUS_CACHE["$key"]="$status"
@@ -888,6 +935,7 @@ remember_entry_status() {
     unset "ENTRY_STATUS_CACHE[$key]"
   fi
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_status_text() {
@@ -901,11 +949,15 @@ stored_entry_status_text() {
 remember_entry_status_text() {
   local pane_id="$1"
   local text="$2"
-  local key
+  local key current
   [[ -n "$pane_id" ]] || return 0
   key="$(metadata_cache_key "$pane_id")"
   text="${text//$'\t'/ }"
   text="${text//$'\n'/ }"
+  current="${ENTRY_STATUS_TEXT_CACHE[$key]:-}"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" == "1" && "$current" == "$text" ]]; then
+    return 0
+  fi
   if [[ -n "$text" ]]; then
     set_option "$(meta_option_key "$pane_id" status_text)" "$text"
     ENTRY_STATUS_TEXT_CACHE["$key"]="$text"
@@ -914,6 +966,7 @@ remember_entry_status_text() {
     unset "ENTRY_STATUS_TEXT_CACHE[$key]"
   fi
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_last_done() {
@@ -927,9 +980,13 @@ stored_entry_last_done() {
 remember_entry_last_done() {
   local pane_id="$1"
   local value="$2"
-  local key
+  local key current
   [[ -n "$pane_id" ]] || return 0
   key="$(metadata_cache_key "$pane_id")"
+  current="${ENTRY_LAST_DONE_CACHE[$key]:-}"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" == "1" && "$current" == "$value" ]]; then
+    return 0
+  fi
   if [[ -n "$value" ]]; then
     set_option "$(meta_option_key "$pane_id" last_done)" "$value"
     ENTRY_LAST_DONE_CACHE["$key"]="$value"
@@ -938,6 +995,7 @@ remember_entry_last_done() {
     unset "ENTRY_LAST_DONE_CACHE[$key]"
   fi
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 stored_entry_branch() {
@@ -969,35 +1027,47 @@ remember_entry_branch_cache() {
   local path="$2"
   local branch="$3"
   local checked="$4"
-  local key
+  local key changed=0
   [[ -n "$pane_id" ]] || return 0
   key="$(metadata_cache_key "$pane_id")"
 
-  if [[ -n "$branch" ]]; then
-    set_option "$(meta_option_key "$pane_id" branch)" "$branch"
-    ENTRY_BRANCH_VALUE_CACHE["$key"]="$branch"
-  else
-    unset_option "$(meta_option_key "$pane_id" branch)"
-    unset "ENTRY_BRANCH_VALUE_CACHE[$key]"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" != "1" || "${ENTRY_BRANCH_VALUE_CACHE[$key]:-}" != "$branch" ]]; then
+    if [[ -n "$branch" ]]; then
+      set_option "$(meta_option_key "$pane_id" branch)" "$branch"
+      ENTRY_BRANCH_VALUE_CACHE["$key"]="$branch"
+    else
+      unset_option "$(meta_option_key "$pane_id" branch)"
+      unset "ENTRY_BRANCH_VALUE_CACHE[$key]"
+    fi
+    changed=1
   fi
 
-  if [[ -n "$path" ]]; then
-    set_option "$(meta_option_key "$pane_id" branch_path)" "$path"
-    ENTRY_BRANCH_PATH_CACHE["$key"]="$path"
-  else
-    unset_option "$(meta_option_key "$pane_id" branch_path)"
-    unset "ENTRY_BRANCH_PATH_CACHE[$key]"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" != "1" || "${ENTRY_BRANCH_PATH_CACHE[$key]:-}" != "$path" ]]; then
+    if [[ -n "$path" ]]; then
+      set_option "$(meta_option_key "$pane_id" branch_path)" "$path"
+      ENTRY_BRANCH_PATH_CACHE["$key"]="$path"
+    else
+      unset_option "$(meta_option_key "$pane_id" branch_path)"
+      unset "ENTRY_BRANCH_PATH_CACHE[$key]"
+    fi
+    changed=1
   fi
 
-  if [[ -n "$checked" ]]; then
-    set_option "$(meta_option_key "$pane_id" branch_checked)" "$checked"
-    ENTRY_BRANCH_CHECKED_CACHE["$key"]="$checked"
-  else
-    unset_option "$(meta_option_key "$pane_id" branch_checked)"
-    unset "ENTRY_BRANCH_CHECKED_CACHE[$key]"
+  if [[ "$SESSION_METADATA_CACHE_LOADED" != "1" || "${ENTRY_BRANCH_CHECKED_CACHE[$key]:-}" != "$checked" ]]; then
+    if [[ -n "$checked" ]]; then
+      set_option "$(meta_option_key "$pane_id" branch_checked)" "$checked"
+      ENTRY_BRANCH_CHECKED_CACHE["$key"]="$checked"
+    else
+      unset_option "$(meta_option_key "$pane_id" branch_checked)"
+      unset "ENTRY_BRANCH_CHECKED_CACHE[$key]"
+    fi
+    changed=1
   fi
 
-  SESSION_METADATA_CACHE_LOADED=1
+  if [[ "$changed" == "1" ]]; then
+    SESSION_METADATA_CACHE_LOADED=1
+    invalidate_entry_caches
+  fi
 }
 
 clear_entry_branch_cache() {
@@ -1011,6 +1081,7 @@ clear_entry_branch_cache() {
   unset "ENTRY_BRANCH_PATH_CACHE[$key]"
   unset "ENTRY_BRANCH_CHECKED_CACHE[$key]"
   SESSION_METADATA_CACHE_LOADED=1
+  invalidate_entry_caches
 }
 
 clear_entry_metadata() {
@@ -1082,6 +1153,7 @@ resolve_entry_provider() {
   local pane_title="$4"
   local pane_command="$5"
   local pane_id="${6:-}"
+  local pane_state_override="${7:-}"
   local provider
 
   if valid_entry_provider "$stored_provider"; then
@@ -1090,7 +1162,10 @@ resolve_entry_provider() {
   fi
 
   if [[ -n "$pane_id" ]]; then
-    provider="$(pane_option "$pane_id" @pi_session_state)"
+    provider="$pane_state_override"
+    if [[ -z "$provider" ]]; then
+      provider="$(pane_option "$pane_id" @pi_session_state)"
+    fi
     if [[ -n "$provider" ]]; then
       echo "pi"
       return
@@ -1203,6 +1278,7 @@ derive_entry_label() {
 effective_entry_status() {
   local pane_id="$1"
   local kind="$2"
+  local pane_state_override="${3:-}"
   local status last_done ttl now age pane_state
 
   status="$(stored_entry_status "$pane_id")"
@@ -1211,7 +1287,10 @@ effective_entry_status() {
   fi
 
   if [[ -z "$status" ]]; then
-    pane_state="$(pane_option "$pane_id" @pi_session_state)"
+    pane_state="$pane_state_override"
+    if [[ -z "$pane_state" ]]; then
+      pane_state="$(pane_option "$pane_id" @pi_session_state)"
+    fi
     if valid_entry_status "$pane_state"; then
       status="$pane_state"
     fi
@@ -1220,7 +1299,7 @@ effective_entry_status() {
   if [[ "$status" == "done" ]]; then
     last_done="$(stored_entry_last_done "$pane_id")"
     ttl="$(done_status_ttl)"
-    now="$(date +%s)"
+    now="$(current_epoch)"
     if [[ "$last_done" =~ ^[0-9]+$ && "$ttl" =~ ^[0-9]+$ ]]; then
       age=$((now - last_done))
       if ((age > ttl)); then
@@ -1238,7 +1317,12 @@ effective_entry_status() {
 
 path_label() {
   local path="$1"
-  basename "$path" 2>/dev/null || true
+  path="${path%/}"
+  if [[ -z "$path" ]]; then
+    echo "/"
+  else
+    echo "${path##*/}"
+  fi
 }
 
 git_branch_for_pane() {
@@ -1252,7 +1336,7 @@ git_branch_for_pane() {
   cached_path="$(stored_entry_branch_path "$pane_id")"
   cached_branch="$(stored_entry_branch "$pane_id")"
   cached_checked="$(stored_entry_branch_checked "$pane_id")"
-  now="$(date +%s)"
+  now="$(current_epoch)"
 
   if [[ "$cached_path" == "$path" && "$cached_checked" =~ ^[0-9]+$ ]]; then
     if (( now - cached_checked < BRANCH_CACHE_TTL )); then
@@ -1303,7 +1387,7 @@ unique_entry_label_for_pane() {
 }
 
 collect_entry_lines() {
-  local sidebar_pane store_session line session_id window_id window_name pane_id pane_dead pane_title pane_command pane_path pane_folder pane_branch
+  local sidebar_pane store_session line session_id window_id window_name pane_id pane_dead pane_title pane_command pane_path pane_folder pane_branch pane_state
   local stored_kind stored_provider label base_label provider kind status status_text last_done suffix key
   local cached_path cached_branch cached_checked now age
   local -A seen_labels=()
@@ -1332,7 +1416,7 @@ collect_entry_lines() {
       cached_path="${ENTRY_BRANCH_PATH_CACHE[$key]:-}"
       cached_branch="${ENTRY_BRANCH_VALUE_CACHE[$key]:-}"
       cached_checked="${ENTRY_BRANCH_CHECKED_CACHE[$key]:-}"
-      now="$(date +%s)"
+      now="$(current_epoch)"
       if [[ "$cached_path" == "$pane_path" && "$cached_checked" =~ ^[0-9]+$ ]]; then
         age=$((now - cached_checked))
       else
@@ -1352,7 +1436,14 @@ collect_entry_lines() {
       fi
     fi
 
-    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "" "$pane_title" "$pane_command" "$pane_id")"
+    pane_state=""
+    if [[ -z "$stored_provider" || -z "${ENTRY_STATUS_CACHE[$key]:-}" ]]; then
+      pane_state="$(pane_option "$pane_id" @pi_session_state)"
+    elif ! valid_entry_provider "$stored_provider"; then
+      pane_state="$(pane_option "$pane_id" @pi_session_state)"
+    fi
+
+    provider="$(resolve_entry_provider "$stored_provider" "$stored_kind" "" "$pane_title" "$pane_command" "$pane_id" "$pane_state")"
     if [[ "$stored_kind" == "agent" && "$provider" != "pi" && "$provider" != "codex" && "$provider" != "claude" ]] && is_shell_command "$pane_command" && is_generic_host_title "$pane_title"; then
       stored_kind="pane"
       remember_entry_kind "$pane_id" pane
@@ -1370,7 +1461,7 @@ collect_entry_lines() {
     seen_labels["$label"]="$pane_id"
 
     kind="$(resolve_entry_kind "$stored_kind" "$provider" "$label" "$pane_title" "$pane_command")"
-    status="$(effective_entry_status "$pane_id" "$kind")"
+    status="$(effective_entry_status "$pane_id" "$kind" "$pane_state")"
     status_text="${ENTRY_STATUS_TEXT_CACHE[$key]:-}"
     [[ "$status" == "tool" ]] || status_text=""
     last_done="${ENTRY_LAST_DONE_CACHE[$key]:-}"
@@ -1380,11 +1471,29 @@ collect_entry_lines() {
   done < <(tmux list-panes -a -F "#{session_id}${DELIM}#{window_id}${DELIM}#{window_name}${DELIM}#{pane_id}${DELIM}#{pane_dead}${DELIM}#{pane_title}${DELIM}#{pane_current_command}${DELIM}#{pane_current_path}")
 }
 
-discover_entries() {
+emit_cached_lines() {
+  local -n lines_ref=$1
+  if ((${#lines_ref[@]} > 0)); then
+    printf '%s\n' "${lines_ref[@]}"
+  fi
+}
+
+discover_entries_uncached() {
   collect_entry_lines
 }
 
-ordered_entry_lines() {
+load_discovered_entries_cache() {
+  [[ "$DISCOVERED_ENTRY_LINES_CACHE_READY" == "1" ]] && return 0
+  mapfile -t DISCOVERED_ENTRY_LINES_CACHE < <(discover_entries_uncached)
+  DISCOVERED_ENTRY_LINES_CACHE_READY=1
+}
+
+discover_entries() {
+  load_discovered_entries_cache
+  emit_cached_lines DISCOVERED_ENTRY_LINES_CACHE
+}
+
+ordered_entry_lines_uncached() {
   local -a lines agent_records pane_records
   local -A order_index manual_agent_index manual_pane_index
   local line label pane_id _window_id _window_name kind sort_label priority sequence manual_priority
@@ -1436,12 +1545,45 @@ ordered_entry_lines() {
   fi
 }
 
+load_ordered_entry_lines_cache() {
+  [[ "$ORDERED_ENTRY_LINES_CACHE_READY" == "1" ]] && return 0
+  mapfile -t ORDERED_ENTRY_LINES_CACHE < <(ordered_entry_lines_uncached)
+  ORDERED_ENTRY_LINES_CACHE_READY=1
+}
+
+ordered_entry_lines() {
+  load_ordered_entry_lines_cache
+  emit_cached_lines ORDERED_ENTRY_LINES_CACHE
+}
+
+load_ordered_section_caches() {
+  local line kind _label _pane_id _window_id _window_name _rest
+  [[ "$ORDERED_AGENT_LINES_CACHE_READY" == "1" && "$ORDERED_PANE_LINES_CACHE_READY" == "1" ]] && return 0
+
+  ORDERED_AGENT_LINES_CACHE=()
+  ORDERED_PANE_LINES_CACHE=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    IFS="$DELIM" read -r _label _pane_id _window_id _window_name kind _rest <<<"$line"
+    if [[ "$kind" == "agent" ]]; then
+      ORDERED_AGENT_LINES_CACHE+=("$line")
+    else
+      ORDERED_PANE_LINES_CACHE+=("$line")
+    fi
+  done < <(ordered_entry_lines)
+
+  ORDERED_AGENT_LINES_CACHE_READY=1
+  ORDERED_PANE_LINES_CACHE_READY=1
+}
+
 ordered_agent_lines() {
-  ordered_entry_lines | awk -F "$DELIM" '$5 == "agent" { print }'
+  load_ordered_section_caches
+  emit_cached_lines ORDERED_AGENT_LINES_CACHE
 }
 
 ordered_pane_lines() {
-  ordered_entry_lines | awk -F "$DELIM" '$5 != "agent" { print }'
+  load_ordered_section_caches
+  emit_cached_lines ORDERED_PANE_LINES_CACHE
 }
 
 ordered_agent_names() {
@@ -1569,12 +1711,14 @@ append_agent_order() {
   order="$(get_option @agents_sidebar_order)"
   if [[ -z "$order" ]]; then
     set_option @agents_sidebar_order "$label"
+    invalidate_entry_caches
     return
   fi
   for existing in $order; do
     [[ "$existing" == "$label" ]] && return
   done
   set_option @agents_sidebar_order "$order $label"
+  invalidate_entry_caches
 }
 
 prune_manual_order_option() {
@@ -2385,9 +2529,9 @@ cmd_repair() {
 _cmd_repair_impl() {
   local mode compact_window focus_pane first_name first_pane
 
-  cleanup_dead_panes
   mode="$(get_option @agents_sidebar_mode)"
   [[ "$mode" == 'compact' ]] || return 0
+  cleanup_dead_panes
 
   compact_window="$(get_option @agents_sidebar_compact_window)"
   focus_pane="$(get_option @agents_sidebar_focus_pane)"
@@ -2550,7 +2694,7 @@ cmd_set_status() {
     remember_entry_status_text "$pane_id" ""
   fi
   if [[ "$status" == "done" ]]; then
-    remember_entry_last_done "$pane_id" "$(date +%s)"
+    remember_entry_last_done "$pane_id" "$(current_epoch)"
   elif [[ "$status" != "done" ]]; then
     remember_entry_last_done "$pane_id" ""
   fi
@@ -2636,6 +2780,9 @@ cmd_maintain_sidebar_width() {
 }
 
 cmd_save_wide_layout() {
+  local mode
+  mode="$(get_option @agents_sidebar_mode)"
+  [[ "$mode" != 'compact' ]] || return 0
   cleanup_dead_panes
   save_wide_layout
 }
@@ -2644,7 +2791,6 @@ cmd_maybe_auto_compact() {
   local mode width compact_threshold client_count client_tty token
 
   mode_transition_active && return 0
-  cleanup_dead_panes
   option_is_enabled "$(auto_compact_on_narrow)" || return 0
   mode="$(get_option @agents_sidebar_mode)"
   [[ "$mode" != 'compact' ]] || return 0
@@ -2683,7 +2829,6 @@ cmd_run_auto_compact() {
   current_token="$(get_option @agents_sidebar_pending_auto_compact_token)"
   [[ -n "$token" && "$token" == "$current_token" ]] || return 0
 
-  cleanup_dead_panes
   option_is_enabled "$(auto_compact_on_narrow)" || { clear_pending_auto_compact; return 0; }
   mode="$(get_option @agents_sidebar_mode)"
   [[ "$mode" != 'compact' ]] || { clear_pending_auto_compact; return 0; }
@@ -2696,6 +2841,7 @@ cmd_run_auto_compact() {
   [[ "$width" =~ ^[0-9]+$ && "$compact_threshold" =~ ^[0-9]+$ ]] || { clear_pending_auto_compact; return 0; }
   (( width <= compact_threshold )) || { clear_pending_auto_compact; return 0; }
 
+  cleanup_dead_panes
   set_option @agents_sidebar_compact_reason auto-narrow
   save_wide_layout
   cmd_compact

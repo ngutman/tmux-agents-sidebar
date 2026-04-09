@@ -179,9 +179,10 @@ class SidebarApp:
         )
 
     def ordered_entries(self, state: SidebarState) -> List[Entry]:
-        agents = [entry for entry in state.entries if entry.kind == "agent"]
-        panes = [entry for entry in state.entries if entry.kind != "agent"]
-        return agents + panes
+        return state.entries
+
+    def agent_count(self, state: SidebarState) -> int:
+        return sum(1 for entry in state.entries if entry.kind == "agent")
 
     def sync_selection(self, previous: Optional[SidebarState], current: SidebarState) -> None:
         ordered = self.ordered_entries(current)
@@ -361,38 +362,56 @@ class SidebarApp:
             parts.extend([DIM, " ", FG_RED, "?", RESET])
         return self.pad_ansi("".join(parts), width)
 
-    def build_body_rows(self, state: SidebarState, width: int) -> List[Tuple[str, Optional[int]]]:
+    def build_body_row_specs(self, state: SidebarState) -> List[Tuple[str, Optional[int]]]:
         ordered = self.ordered_entries(state)
-        agents = [entry for entry in ordered if entry.kind == "agent"]
-        panes = [entry for entry in ordered if entry.kind != "agent"]
-        rows: List[Tuple[str, Optional[int]]] = []
+        agents_count = self.agent_count(state)
+        panes_count = len(ordered) - agents_count
+        rows: List[Tuple[str, Optional[int]]] = [("agents-header", None)]
 
-        rows.append((self.render_line(self.pad_plain(f" Agents ({len(agents)}) ", width), BOLD, FG_CYAN), None))
-        if agents:
-            for index, entry in enumerate(agents):
-                rows.append((self.entry_row(index + 1, entry, index == self.selected_index, width), index))
+        if agents_count:
+            for index in range(agents_count):
+                rows.append(("entry", index))
         else:
-            rows.append((self.render_line(self.pad_plain(" -- no detected coding agents --", width), DIM), None))
+            rows.append(("no-agents", None))
 
-        rows.append((self.pad_plain("", width), None))
-        rows.append((self.render_line(self.pad_plain(f" Panes ({len(panes)}) ", width), BOLD, FG_GREEN), None))
-        if panes:
-            start = len(agents)
-            for offset, entry in enumerate(panes, start=start):
-                rows.append((self.entry_row(offset + 1, entry, offset == self.selected_index, width), offset))
+        rows.append(("blank", None))
+        rows.append(("panes-header", None))
+        if panes_count:
+            for index in range(agents_count, len(ordered)):
+                rows.append(("entry", index))
         else:
-            rows.append((self.render_line(self.pad_plain(" -- no regular panes --", width), DIM), None))
+            rows.append(("no-panes", None))
 
         return rows
+
+    def render_body_row_spec(
+        self, ordered: List[Entry], agents_count: int, width: int, row_kind: str, entry_index: Optional[int]
+    ) -> str:
+        panes_count = len(ordered) - agents_count
+
+        if row_kind == "agents-header":
+            return self.render_line(self.pad_plain(f" Agents ({agents_count}) ", width), BOLD, FG_CYAN)
+        if row_kind == "panes-header":
+            return self.render_line(self.pad_plain(f" Panes ({panes_count}) ", width), BOLD, FG_GREEN)
+        if row_kind == "no-agents":
+            return self.render_line(self.pad_plain(" -- no detected coding agents --", width), DIM)
+        if row_kind == "no-panes":
+            return self.render_line(self.pad_plain(" -- no regular panes --", width), DIM)
+        if row_kind == "blank":
+            return self.pad_plain("", width)
+        if row_kind == "entry" and entry_index is not None and 0 <= entry_index < len(ordered):
+            entry = ordered[entry_index]
+            return self.entry_row(entry_index + 1, entry, entry_index == self.selected_index, width)
+        return self.pad_plain("", width)
 
     def footer_line_count(self) -> int:
         return 7
 
     def body_window(self, state: SidebarState, width: int) -> Tuple[int, int, List[Tuple[str, Optional[int]]]]:
-        rows = self.build_body_rows(state, width)
+        rows = self.build_body_row_specs(state)
         viewport = max(1, max(8, state.height) - self.footer_line_count())
         selected_row = 0
-        for idx, (_line, entry_index) in enumerate(rows):
+        for idx, (_row_kind, entry_index) in enumerate(rows):
             if entry_index == self.selected_index:
                 selected_row = idx
                 break
@@ -409,14 +428,14 @@ class SidebarApp:
         separator = "─" * width
         lines: List[str] = []
 
+        ordered = self.ordered_entries(state)
+        agents_count = self.agent_count(state)
         _start, body_height, visible_rows = self.body_window(state, width)
-        for line, _entry_index in visible_rows:
-            lines.append(line)
+        for row_kind, entry_index in visible_rows:
+            lines.append(self.render_body_row_spec(ordered, agents_count, width, row_kind, entry_index))
         while len(lines) < body_height:
             lines.append(self.pad_plain("", width))
 
-        ordered = self.ordered_entries(state)
-        agents_count = len([entry for entry in ordered if entry.kind == "agent"])
         panes_count = len(ordered) - agents_count
         lines.append(self.render_line(self.pad_plain(separator, width), DIM))
         lines.append(self.render_line(self.pad_plain(f" last   {state.last_active_name or '—'}", width), DIM))
