@@ -1356,6 +1356,9 @@ collect_entry_lines() {
     if [[ "$stored_kind" == "agent" && "$provider" != "pi" && "$provider" != "codex" && "$provider" != "claude" ]] && is_shell_command "$pane_command" && is_generic_host_title "$pane_title"; then
       stored_kind="pane"
       remember_entry_kind "$pane_id" pane
+    elif [[ "$stored_kind" == "pane" && ( "$provider" == "pi" || "$provider" == "codex" || "$provider" == "claude" ) ]]; then
+      stored_kind="agent"
+      remember_entry_kind "$pane_id" agent
     fi
     base_label="$(derive_entry_label "$provider" "$pane_title" "$pane_folder" "$pane_branch" "$pane_command" "$pane_id")"
     label="$base_label"
