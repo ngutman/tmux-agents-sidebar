@@ -433,6 +433,21 @@ session_client_count() {
   echo "${count:-0}"
 }
 
+session_window_count() {
+  local count
+  count="$(tmux list-windows -t "$SESSION_ID" -F '#{window_id}' 2>/dev/null | wc -l | tr -d ' ' || true)"
+  echo "${count:-0}"
+}
+
+resolved_wide_window_name() {
+  local value
+  value="$(get_option @agents_sidebar_wide_window_name)"
+  if [[ -z "$value" ]] || is_internal_window_name "$value"; then
+    value="$(wide_window_name_default)"
+  fi
+  echo "$value"
+}
+
 current_client_tty() {
   local tty="${AGENTS_SIDEBAR_CLIENT_TTY:-}"
   if [[ -n "$tty" ]]; then
@@ -1807,15 +1822,24 @@ cleanup_store_state() {
 }
 
 cleanup_visible_store_windows_in_session() {
-  local internal_store_name store_window window_id window_name pane_ids pane_id changed=0
+  local internal_store_name store_window window_id window_name pane_ids pane_id changed=0 window_count recovered_name
 
   internal_store_name="$(store_window_name)"
   store_window="$(store_window_id)"
+  window_count="$(session_window_count)"
+  recovered_name="$(resolved_wide_window_name)"
 
   while IFS="$DELIM" read -r window_id window_name; do
     [[ "$window_name" == "$internal_store_name" ]] || continue
 
     pane_ids="$(managed_pane_ids_in_window "$window_id")"
+    if [[ "$window_count" == "1" ]]; then
+      clear_store_state
+      tmux rename-window -t "$window_id" "$recovered_name" >/dev/null 2>&1 || true
+      changed=1
+      continue
+    fi
+
     if [[ -n "$pane_ids" ]]; then
       clear_store_state
       for pane_id in $pane_ids; do
